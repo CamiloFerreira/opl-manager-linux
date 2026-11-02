@@ -34,12 +34,23 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
   lomo, logo, ícono, fondo y capturas, con los nombres que usa OPL (`ART/SLUS_209.46_COV.png`…).
 - Al hacer clic en un juego: renombrarlo al formato OPL, bajar su arte o cambiarle la portada.
 - **Duplicados**: detecta ISOs con el mismo código y te deja elegir cuál conservar; las demás van a la papelera.
+- **Clic derecho en un juego**: ver detalles, cambiar nombre, descargar arte, cambiar portada, abrir carpeta,
+  copiar el nombre del archivo o moverlo a la papelera (opcionalmente con su arte).
 
 **Bandeja de entrada** (tus carpetas de ROMs: descargas, colección en el equipo…):
 - Lee el código de cada juego directamente del disco (`SYSTEM.CNF`) y distingue PS2 de PS1.
 - Marca los que ya tienes en la biblioteca y los que todavía se están extrayendo.
 - Copia los juegos de PS2 a `DVD/` con nombre OPL (`SLUS_209.46.Nombre.iso`, opcionalmente corto para OPL viejo),
   y los `.bin`/`.cue` de PS1 a la carpeta que elijas. También lleva la portada local y descarga el arte.
+- **Limpiar** (botón 🗑): mueve a la papelera los juegos que ya copiaste o los que selecciones. Si el juego está en su
+  propia carpeta, se va la carpeta entera (con sus `.url`, `.txt`, portadas…). También puede hacerlo solo después de
+  cada copia, siempre comprobando antes que la copia quedó completa.
+- Selección rápida (nuevos, todos, ya copiados, ninguno) y clic derecho en cada juego: copiar solo ese, cambiar
+  nombre, abrir carpeta o moverlo a la papelera.
+
+**Ventana**:
+- Se adapta a cualquier tamaño, hasta el de un teléfono (las pestañas pasan abajo y las barras se reacomodan).
+- Si la cierras mientras copia, la copia sigue en segundo plano y te avisa con una notificación al terminar.
 
 **Unidades**:
 - Busca sola el pendrive o disco con OPL conectado, y avisa cuando conectas uno.
@@ -55,7 +66,8 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 ## Seguridad
 - En la biblioteca nunca se borra ni se sobrescribe nada sin preguntar. Al cambiar una portada, la anterior queda como `.bak`.
   Los duplicados van a la papelera, no se borran.
-- La bandeja no se modifica: los juegos se **copian**, no se mueven.
+- La bandeja no se modifica al copiar: los juegos se **copian**, no se mueven. Solo se limpia cuando tú lo pides,
+  siempre con confirmación y a la papelera; si la unidad no tiene papelera, pregunta antes de borrar definitivamente.
 - Cada copia se escribe como `.part` y solo se renombra al terminar completa.
 
 ## Instalar

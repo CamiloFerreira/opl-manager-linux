@@ -101,5 +101,27 @@ class TestImport(unittest.TestCase):
                 core.import_item(again[0], cfg)
 
 
+class TestCleanup(unittest.TestCase):
+    def test_targets(self):
+        with tempfile.TemporaryDirectory() as d:
+            inbox = os.path.join(d, "in")
+            # juego en su carpeta (se borra la carpeta), juego suelto en DVD/ (solo el archivo),
+            # carpeta con dos juegos de los que solo se limpia uno (solo su archivo)
+            os.makedirs(os.path.join(inbox, "Killer7 [PAL]"))
+            os.makedirs(os.path.join(inbox, "DVD"))
+            os.makedirs(os.path.join(inbox, "Pack"))
+            for rel in ("Killer7 [PAL]/k.iso", "DVD/SLUS_209.95.KOF.iso", "Pack/a.iso", "Pack/b.iso"):
+                make_iso(os.path.join(inbox, rel), b"BOOT2 = cdrom0:\\SLES_111.11;1\r\n")
+                os.utime(os.path.join(inbox, rel), (1, 1))
+            with open(os.path.join(inbox, "Killer7 [PAL]", "LEEME.txt"), "w") as f:
+                f.write("x")
+            items, _ = core.scan_inboxes([inbox], "")
+            pick = [i for i in items if os.path.basename(i.main) in ("k.iso", "SLUS_209.95.KOF.iso", "a.iso")]
+            got = sorted(os.path.relpath(t, inbox) for t in core.cleanup_targets(pick))
+            self.assertEqual(got, ["DVD/SLUS_209.95.KOF.iso", "Killer7 [PAL]", "Pack/a.iso"])
+            both = [i for i in items if os.path.dirname(i.main).endswith("Pack")]
+            self.assertEqual([os.path.relpath(t, inbox) for t in core.cleanup_targets(both)], ["Pack"])
+
+
 if __name__ == "__main__":
     unittest.main()

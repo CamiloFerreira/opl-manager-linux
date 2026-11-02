@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OPL Manager para Linux — gestor de la biblioteca de Open PS2 Loader (GTK 4 + libadwaita)."""
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -89,6 +90,221 @@ def cover_widget(path, w=COVER_W, h=COVER_H, label=""):
     return box
 
 
+# =============================================================== Utilidades comunes
+def add_context_menu(widget, build_menu):
+    """Menú con clic derecho (o manteniendo pulsado en pantallas táctiles)."""
+    def show(x, y):
+        pop = Gtk.PopoverMenu.new_from_model(build_menu())
+        pop.set_parent(widget)
+        pop.set_has_arrow(False)
+        r = Gdk.Rectangle()
+        r.x, r.y, r.width, r.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(r)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
+    def pressed(gesture, _n, x, y):
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        show(x, y)
+    click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+    click.connect("pressed", pressed)
+    widget.add_controller(click)
+    hold = Gtk.GestureLongPress(touch_only=True)
+    hold.connect("pressed", lambda _g, x, y: show(x, y))
+    widget.add_controller(hold)
+
+
+def action_group(actions):
+    """{nombre: (función, habilitada)} -> Gio.SimpleActionGroup"""
+    group = Gio.SimpleActionGroup()
+    for name, (cb, enabled) in actions.items():
+        a = Gio.SimpleAction.new(name, None)
+        a.connect("activate", lambda *_a, cb=cb: cb())
+        a.set_enabled(enabled)
+        group.add_action(a)
+    return group
+
+
+def open_folder(path):
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(folder), None)
+
+
+def confirm_trash(win, heading, paths, on_yes, extra_body="", extra_child=None):
+    """Pide confirmación para mover rutas a la papelera (muestra cuántas y cuánto pesan)."""
+    names = [os.path.basename(p.rstrip("/")) + ("/" if os.path.isdir(p) else "") for p in paths]
+    total = sum(core.path_size(p) for p in paths)
+    body = "\n".join(f"• {n}" for n in names[:8]) + (f"\n… y {len(names) - 8} más" if len(names) > 8 else "")
+    body += f"\n\nTotal: {core.human_size(total)}. Van a la papelera: puedes recuperarlos desde Archivos."
+    if extra_body:
+        body += "\n\n" + extra_body
+    ask = Adw.AlertDialog(heading=heading, body=body)
+    if extra_child:
+        ask.set_extra_child(extra_child)
+    ask.add_response("cancel", "Cancelar")
+    ask.add_response("trash", "Mover a la papelera")
+    ask.set_response_appearance("trash", Adw.ResponseAppearance.DESTRUCTIVE)
+    ask.set_default_response("cancel")
+    ask.set_close_response("cancel")
+    ask.connect("response", lambda _d, r: r == "trash" and on_yes())
+    ask.present(win)
+
+
+def trash_paths(win, paths, on_done=None):
+    """Mueve a la papelera en segundo plano. Si la unidad no tiene papelera, pregunta antes de borrar."""
+    def work():
+        moved, unsupported, errors = 0, [], []
+        for p in paths:
+            try:
+                Gio.File.new_for_path(p).trash(None)
+                moved += 1
+            except GLib.Error as e:
+                if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_SUPPORTED):
+                    unsupported.append(p)
+                elif e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_FOUND):
+                    moved += 1
+                else:
+                    errors.append(f"{os.path.basename(p)}: {e.message}")
+        return moved, unsupported, errors
+
+    def delete_forever(ps):
+        def work2():
+            n = 0
+            for p in ps:
+                try:
+                    shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+                    n += 1
+                except OSError:
+                    pass
+            return n
+        run_bg(work2, lambda n: (win.toast(f"{n} eliminado(s) definitivamente"), on_done and on_done()))
+
+    def done(res):
+        moved, unsupported, errors = res
+        if moved:
+            win.toast(f"{moved} elemento(s) movidos a la papelera")
+        if errors:
+            al = Adw.AlertDialog(heading="Algunos no se pudieron mover", body="\n".join(errors[:10]))
+            al.add_response("ok", "Aceptar")
+            al.present(win)
+        if unsupported:
+            al = Adw.AlertDialog(
+                heading="Esta unidad no tiene papelera",
+                body="No se pueden mover a la papelera:\n" + "\n".join(f"• {os.path.basename(p)}" for p in unsupported[:8])
+                     + "\n\n¿Eliminarlos definitivamente? No se podrán recuperar.")
+            al.add_response("cancel", "Cancelar")
+            al.add_response("delete", "Eliminar definitivamente")
+            al.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+            al.set_default_response("cancel")
+            al.set_close_response("cancel")
+            al.connect("response", lambda _d, r: delete_forever(unsupported) if r == "delete" else (on_done and on_done()))
+            al.present(win)
+        elif on_done:
+            on_done()
+    run_bg(work, done)
+
+
+def rename_dialog(win, game, on_done=None):
+    ml = int(win.cfg.get("max_name", 32) or 0)
+    dlg = Adw.AlertDialog(heading="Cambiar nombre")
+    entry = Gtk.Entry(text=game.title, activates_default=True)
+    hint = Gtk.Label(xalign=0, wrap=True)
+    hint.add_css_class("caption")
+    hint.add_css_class("dim-label")
+
+    def upd(*_):
+        hint.set_text("Quedará como: " + core.opl_filename(game.gid, entry.get_text(), core.ext_of(game.path), ml))
+    entry.connect("changed", upd)
+    upd()
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    box.append(entry)
+    box.append(hint)
+    dlg.set_extra_child(box)
+    dlg.add_response("cancel", "Cancelar")
+    dlg.add_response("ok", "Cambiar nombre")
+    dlg.set_default_response("ok")
+    dlg.set_close_response("cancel")
+    dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+
+    def resp(_d, r):
+        if r != "ok" or not entry.get_text().strip():
+            return
+        try:
+            new = core.rename_game(game, entry.get_text().strip(), ml)
+        except Exception as e:  # noqa: BLE001
+            win.toast(f"No se pudo renombrar: {e}")
+            return
+        win.toast(f"Renombrado a {os.path.basename(new)}")
+        win.library.reload()
+        if on_done:
+            on_done()
+    dlg.connect("response", resp)
+    dlg.present(win)
+    entry.grab_focus()
+
+
+def choose_cover(win, game, parent=None, on_done=None):
+    d = Gtk.FileDialog(title="Elegir portada")
+    f = Gtk.FileFilter(name="Imágenes")
+    f.add_mime_type("image/*")
+    store = Gio.ListStore.new(Gtk.FileFilter)
+    store.append(f)
+    d.set_filters(store)
+
+    def save(path, replace):
+        try:
+            if replace:
+                cur = game.art("COV")
+                os.rename(cur, core.free_path(cur + ".bak"))      # nunca se borra: queda de respaldo
+            core.save_cover(game.library, game.gid, path)
+        except Exception as e:  # noqa: BLE001
+            win.toast(f"No se pudo guardar la portada: {e}")
+            return
+        win.toast("Portada guardada")
+        win.library.reload()
+        if on_done:
+            on_done()
+
+    def chosen(dialog, res):
+        try:
+            path = dialog.open_finish(res).get_path()
+        except GLib.Error:
+            return
+        if game.art("COV"):
+            ask = Adw.AlertDialog(heading="¿Reemplazar la portada?",
+                                  body="Este juego ya tiene portada. La actual se guardará como _COV.png.bak.")
+            ask.add_response("cancel", "Cancelar")
+            ask.add_response("ok", "Reemplazar")
+            ask.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+            ask.connect("response", lambda _d, r: r == "ok" and save(path, True))
+            ask.present(parent or win)
+        else:
+            save(path, False)
+    d.open(win, None, chosen)
+
+
+def download_game_art(win, game, on_done=None):
+    lib = win.cfg["library"]
+
+    def done(got):
+        win.toast(f"{len(got)} imágenes nuevas para {game.title}" if got else "No había arte nuevo en la base")
+        win.library.reload()
+        if on_done:
+            on_done()
+    run_bg(lambda: core.download_art(lib, game.gid), done, lambda e: win.toast(f"Error: {e}"))
+
+
+def trash_game_dialog(win, game):
+    arts = core.game_art_files(game, win.library.games)
+    chk = None
+    if arts:
+        chk = Gtk.CheckButton(label=f"También mover su arte ({len(arts)} imágenes de ART/)")
+    confirm_trash(win, f"¿Mover «{game.title}» a la papelera?", [game.path],
+                  lambda: trash_paths(win, [game.path] + (arts if chk and chk.get_active() else []),
+                                      win.library.reload),
+                  extra_child=chk)
+
+
 # =============================================================== Biblioteca
 class LibraryPage(Gtk.Box):
     def __init__(self, win):
@@ -97,10 +313,16 @@ class LibraryPage(Gtk.Box):
         self.games = []
         self.filter_text = ""
 
-        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
+        # barra: buscador + controles; en ventanas angostas los controles bajan a otra fila
+        self.bar = bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
         self.search = Gtk.SearchEntry(placeholder_text="Buscar juego o código…", hexpand=True)
         self.search.connect("search-changed", self._on_search)
         bar.append(self.search)
+        controls = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False, column_spacing=8,
+                               row_spacing=6, min_children_per_line=1, max_children_per_line=6, valign=Gtk.Align.CENTER)
+        self.controls = controls
+        bar.append(controls)
+        bar = controls          # los controles se agregan a la fila que se acomoda sola
         self.kind = Gtk.DropDown.new_from_strings(["Todos", "PS2 (DVD/CD)", "PS1 (POPS)", "Sin portada"])
         self.kind.connect("notify::selected", lambda *_: self.flow.invalidate_filter())
         bar.append(self.kind)
@@ -117,7 +339,7 @@ class LibraryPage(Gtk.Box):
         self.art_btn = Gtk.Button(label="Descargar arte faltante", tooltip_text="Baja portadas, lomos, fondos y capturas que falten. No sobrescribe nada.")
         self.art_btn.connect("clicked", self._download_all_art)
         bar.append(self.art_btn)
-        self.append(bar)
+        self.append(self.bar)
 
         self.status = Gtk.Label(xalign=0, margin_start=14, margin_bottom=4)
         self.status.add_css_class("dim-label")
@@ -204,6 +426,30 @@ class LibraryPage(Gtk.Box):
         btn.set_child(box)
         btn.set_tooltip_text(f"{g.filename}\n{core.human_size(g.size)}")
         btn.connect("clicked", lambda *_: GameDialog(self.win, g).present(self.win))
+        win = self.win
+        btn.insert_action_group("card", action_group({
+            "open": (lambda: GameDialog(win, g).present(win), True),
+            "rename": (lambda: rename_dialog(win, g), True),
+            "art": (lambda: download_game_art(win, g), bool(g.gid) and g.kind != "POPS"),
+            "cover": (lambda: choose_cover(win, g), bool(g.gid)),
+            "folder": (lambda: open_folder(g.path), True),
+            "copy-name": (lambda: (win.get_clipboard().set(g.filename), win.toast("Nombre copiado")), True),
+            "trash": (lambda: trash_game_dialog(win, g), True),
+        }))
+
+        def menu():
+            m, a, b, c = Gio.Menu(), Gio.Menu(), Gio.Menu(), Gio.Menu()
+            a.append("Ver detalles", "card.open")
+            a.append("Cambiar nombre…", "card.rename")
+            b.append("Descargar arte", "card.art")
+            b.append("Cambiar portada…", "card.cover")
+            b.append("Abrir carpeta", "card.folder")
+            b.append("Copiar nombre del archivo", "card.copy-name")
+            c.append("Mover a la papelera…", "card.trash")
+            for sec in (a, b, c):
+                m.append_section(None, sec)
+            return m
+        add_context_menu(btn, menu)
         child = Gtk.FlowBoxChild(child=btn)
         child.game = g
         return child
@@ -405,15 +651,18 @@ class GameDialog(Adw.Dialog):
         self.name_grp = grp
         page.append(grp)
 
-        acts = Gtk.Box(spacing=8, halign=Gtk.Align.START)
+        acts = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False, column_spacing=8,
+                           row_spacing=8, min_children_per_line=1, max_children_per_line=4)
         b1 = Gtk.Button(label="Descargar arte", sensitive=bool(game.gid))
         b1.connect("clicked", self._download_art)
         b2 = Gtk.Button(label="Cambiar portada…", sensitive=bool(game.gid))
-        b2.connect("clicked", self._change_cover)
+        b2.connect("clicked", lambda *_: choose_cover(self.win, game, self, self.close))
         b3 = Gtk.Button(label="Abrir carpeta")
-        b3.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
-            GLib.filename_to_uri(os.path.dirname(game.path)), None))
-        for b in (b1, b2, b3):
+        b3.connect("clicked", lambda *_: open_folder(game.path))
+        b4 = Gtk.Button(label="Mover a la papelera…")
+        b4.add_css_class("destructive-action")
+        b4.connect("clicked", lambda *_: (self.close(), trash_game_dialog(self.win, game)))
+        for b in (b1, b2, b3, b4):
             acts.append(b)
         page.append(acts)
 
@@ -526,21 +775,55 @@ class InboxPage(Gtk.Box):
         self.checks = []
         self.importing = False
 
-        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
+        # acciones de la bandeja
+        self.trash_after = Gio.SimpleAction.new_stateful(
+            "trash-after", None, GLib.Variant.new_boolean(bool(win.cfg.get("trash_after_copy", False))))
+        self.trash_after.connect("change-state", self._on_trash_after)
+        group = action_group({
+            "select-new": (lambda: self._select(lambda it: not it.in_library), True),
+            "select-all": (lambda: self._select(lambda it: True), True),
+            "select-none": (lambda: self._select(lambda it: False), True),
+            "select-copied": (lambda: self._select(lambda it: bool(it.in_library)), True),
+            "clean-copied": (self._clean_copied, True),
+            "clean-selected": (self._clean_selected, True),
+            "open-folder": (lambda: [open_folder(r) for r in (self.win.cfg.get("inboxes") or [])[:3] if os.path.isdir(r)], True),
+        })
+        group.add_action(self.trash_after)
+        self.insert_action_group("inbox", group)
+
+        self.bar = bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
         self.status = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
         self.status.add_css_class("dim-label")
         self.status.add_css_class("caption")
         bar.append(self.status)
+        buttons = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False, column_spacing=8,
+                              row_spacing=6, min_children_per_line=1, max_children_per_line=6,
+                              valign=Gtk.Align.CENTER)
+        self.compact = False
         add = Gtk.Button(icon_name="folder-new-symbolic", tooltip_text="Agregar carpeta de ROMs del equipo")
         add.connect("clicked", lambda *_: self.win.add_inbox_folder())
-        bar.append(add)
-        sel = Gtk.Button(label="Seleccionar nuevos")
-        sel.connect("clicked", self._select_new)
-        bar.append(sel)
+        buttons.append(add)
+        selm = Gio.Menu()
+        selm.append("Nuevos", "inbox.select-new")
+        selm.append("Todos", "inbox.select-all")
+        selm.append("Ya copiados", "inbox.select-copied")
+        selm.append("Ninguno", "inbox.select-none")
+        buttons.append(Gtk.MenuButton(label="Seleccionar", menu_model=selm, tooltip_text="Elegir qué juegos marcar"))
+        cleanm, c1, c2 = Gio.Menu(), Gio.Menu(), Gio.Menu()
+        c1.append("Mover a la papelera los ya copiados", "inbox.clean-copied")
+        c1.append("Mover a la papelera los seleccionados", "inbox.clean-selected")
+        c2.append("Mover a la papelera después de copiar", "inbox.trash-after")
+        c2.append("Abrir carpeta de ROMs", "inbox.open-folder")
+        cleanm.append_section(None, c1)
+        cleanm.append_section(None, c2)
+        self.clean_btn = Gtk.MenuButton(icon_name="user-trash-symbolic", menu_model=cleanm,
+                                        tooltip_text="Limpiar la bandeja (las ISOs ya copiadas y más)")
+        buttons.append(self.clean_btn)
         self.import_btn = Gtk.Button(label="Copiar a la biblioteca")
         self.import_btn.add_css_class("suggested-action")
-        self.import_btn.connect("clicked", self._import)
-        bar.append(self.import_btn)
+        self.import_btn.connect("clicked", lambda *_: self._import())
+        buttons.append(self.import_btn)
+        bar.append(buttons)
         self.append(bar)
 
         self.progress = Gtk.ProgressBar(margin_start=12, margin_end=12, visible=False, show_text=True)
@@ -566,9 +849,9 @@ class InboxPage(Gtk.Box):
         self.append(self.stack)
 
         note = Gtk.Label(wrap=True, xalign=0, margin_start=14, margin_end=14, margin_bottom=8,
-                         label="Se copian (no se mueven): en la bandeja no se borra nada y en la biblioteca nunca se "
-                               "sobrescribe. Los PS2 van a DVD/ con nombre OPL; los .bin/.cue van a la carpeta de PS1 "
-                               "elegida en Ajustes, con su nombre original.")
+                         label="Se copian, no se mueven, y en la biblioteca nunca se sobrescribe nada. Los PS2 van a DVD/ "
+                               "con nombre OPL; los .bin/.cue a la carpeta de PS1 de Ajustes. Con 🗑 puedes llevar a la "
+                               "papelera lo que ya copiaste. Clic derecho en un juego para más opciones.")
         note.add_css_class("caption")
         note.add_css_class("dim-label")
         self.append(note)
@@ -628,7 +911,7 @@ class InboxPage(Gtk.Box):
         row.set_subtitle_lines(2)
 
         chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=not it.in_library and not it.busy,
-                              sensitive=not it.busy and not it.in_library)
+                              sensitive=not it.busy)
         chk.connect("toggled", lambda *_: self._update_btn())
         chk.item = it
         self.checks.append(chk)
@@ -643,6 +926,24 @@ class InboxPage(Gtk.Box):
             ed.add_css_class("flat")
             ed.connect("clicked", lambda *_: self._edit_title(it, row))
             row.add_suffix(ed)
+
+        row.insert_action_group("row", action_group({
+            "copy": (lambda: self._import([it]), not it.busy and not it.in_library and not self.importing),
+            "rename": (lambda: self._edit_title(it, row), not it.multi),
+            "folder": (lambda: open_folder(it.main), True),
+            "trash": (lambda: self._confirm_clean([it], f"¿Mover «{it.title}» a la papelera?"), not it.busy),
+        }))
+
+        def menu():
+            m, a, b = Gio.Menu(), Gio.Menu(), Gio.Menu()
+            a.append("Copiar solo este a la biblioteca", "row.copy")
+            a.append("Cambiar nombre…", "row.rename")
+            a.append("Abrir carpeta", "row.folder")
+            b.append("Mover a la papelera…", "row.trash")
+            m.append_section(None, a)
+            m.append_section(None, b)
+            return m
+        add_context_menu(row, menu)
         return row
 
     def _edit_title(self, it, row):
@@ -676,20 +977,52 @@ class InboxPage(Gtk.Box):
     def _selected(self):
         return [c.item for c in self.checks if c.get_active() and c.get_sensitive()]
 
-    def _update_btn(self):
-        sel = self._selected()
-        size = sum(i.size for i in sel)
-        self.import_btn.set_label(f"Copiar a la biblioteca ({len(sel)} · {core.human_size(size)})" if sel
-                                  else "Copiar a la biblioteca")
-        self.import_btn.set_sensitive(bool(sel) and not self.importing)
+    def _to_copy(self):
+        return [i for i in self._selected() if not i.in_library]
 
-    def _select_new(self, *_):
+    def _select(self, pred):
         for c in self.checks:
             if c.get_sensitive():
-                c.set_active(not c.item.in_library)
+                c.set_active(pred(c.item))
 
-    def _import(self, *_):
+    def _on_trash_after(self, action, value):
+        action.set_state(value)
+        self.win.cfg["trash_after_copy"] = value.get_boolean()
+        core.save_config(self.win.cfg)
+        self.win.toast("Lo copiado se moverá a la papelera" if value.get_boolean()
+                       else "Lo copiado se queda en la bandeja")
+
+    def _confirm_clean(self, items, heading, extra=""):
+        items = [i for i in items if not i.busy]
+        if not items:
+            self.win.toast("No hay nada para limpiar")
+            return
+        targets = core.cleanup_targets(items)
+        confirm_trash(self.win, heading, targets, lambda: trash_paths(self.win, targets, self.reload), extra)
+
+    def _clean_copied(self):
+        copied = [i for i in self.items if i.in_library and not i.busy]
+        self._confirm_clean(copied, f"¿Mover a la papelera {len(copied)} juego(s) ya copiados?",
+                            "Ya están en tu biblioteca OPL; solo se limpian de la bandeja.")
+
+    def _clean_selected(self):
         sel = self._selected()
+        pending = [i for i in sel if not i.in_library]
+        self._confirm_clean(sel, f"¿Mover a la papelera {len(sel)} juego(s) seleccionados?",
+                            f"⚠ {len(pending)} de ellos todavía NO están en la biblioteca." if pending else "")
+
+    def _update_btn(self):
+        sel = self._to_copy()
+        size = sum(i.size for i in sel)
+        if self.compact:
+            self.import_btn.set_label(f"Copiar ({len(sel)})" if sel else "Copiar")
+        else:
+            self.import_btn.set_label(f"Copiar a la biblioteca ({len(sel)} · {core.human_size(size)})" if sel
+                                      else "Copiar a la biblioteca")
+        self.import_btn.set_sensitive(bool(sel) and not self.importing)
+
+    def _import(self, sel=None):
+        sel = [i for i in (sel if sel is not None else self._to_copy()) if not i.in_library and not i.busy]
         lib = self.win.cfg["library"]
         if not sel:
             return
@@ -706,7 +1039,7 @@ class InboxPage(Gtk.Box):
         cfg = dict(self.win.cfg)
 
         def work():
-            ok, errors, art = 0, [], 0
+            ok, errors, art, copied_items = 0, [], 0, []
             for n, it in enumerate(sel):
                 name = it.title
 
@@ -716,15 +1049,19 @@ class InboxPage(Gtk.Box):
                     _copied, got = core.import_item(it, cfg, prog)
                     ok += 1
                     art += len(got)
+                    copied_items.append(it)
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"{name}: {e}")
-            return ok, errors, art
+            return ok, errors, art, copied_items
 
         def done(res):
-            ok, errors, art = res
+            ok, errors, art, copied_items = res
             self.importing = False
             self.progress.set_visible(False)
             msg = f"{ok} juego(s) copiados, {art} imágenes de arte"
+            self.win.job_finished("Copia terminada", msg + (f" · {len(errors)} con error" if errors else ""))
+            if copied_items and self.win.cfg.get("trash_after_copy"):
+                trash_paths(self.win, core.cleanup_targets(copied_items), self.reload)
             if errors:
                 msg += f" · {len(errors)} con error"
                 al = Adw.AlertDialog(heading="Algunos juegos no se copiaron", body="\n".join(errors))
@@ -868,6 +1205,20 @@ class SettingsDialog(Adw.PreferencesDialog):
         g2.add(art)
         page.add(g2)
 
+        g_bg = Adw.PreferencesGroup(title="Ventana")
+        bg = Adw.SwitchRow(title="Seguir copiando en segundo plano al cerrar",
+                           subtitle="Si cierras la ventana durante una copia, sigue y te avisa al terminar.",
+                           active=bool(cfg.get("background_on_close", True)))
+        bg.connect("notify::active", lambda r, _p: self._set("background_on_close", r.get_active(), reload=False))
+        g_bg.add(bg)
+        ta = Adw.SwitchRow(title="Mover a la papelera lo que copies desde la bandeja",
+                           subtitle="Solo después de comprobar que la copia quedó completa.",
+                           active=bool(cfg.get("trash_after_copy", False)))
+        ta.connect("notify::active", lambda r, _p: (self._set("trash_after_copy", r.get_active(), reload=False),
+                                                     self.win.inbox.trash_after.set_state(GLib.Variant.new_boolean(r.get_active()))))
+        g_bg.add(ta)
+        page.add(g_bg)
+
         mode = updater.install_mode()
         how = {"self": "se instalan solas, sin contraseña",
                "deb": "paquete .deb: se instalan con tu contraseña",
@@ -960,7 +1311,7 @@ class MainWindow(Adw.ApplicationWindow):
         tv = Adw.ToolbarView()
         header = Adw.HeaderBar()
         self.vstack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher(stack=self.vstack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.switcher = switcher = Adw.ViewSwitcher(stack=self.vstack, policy=Adw.ViewSwitcherPolicy.WIDE)
         header.set_title_widget(switcher)
 
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Volver a leer (F5)")
@@ -987,8 +1338,30 @@ class MainWindow(Adw.ApplicationWindow):
         self.inbox_page = self.vstack.add_titled_with_icon(self.inbox, "inbox", "Bandeja de entrada",
                                                            "folder-download-symbolic")
         tv.set_content(self.vstack)
+        self.switcher_bar = Adw.ViewSwitcherBar(stack=self.vstack)
+        tv.add_bottom_bar(self.switcher_bar)
         self.toasts.set_child(tv)
         self.set_content(self.toasts)
+
+        # ---- diseño adaptable: la ventana se puede achicar hasta tamaño de teléfono
+        self.set_size_request(360, 480)
+        mid = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 980sp"))
+        mid.add_setter(self.library.bar, "orientation", Gtk.Orientation.VERTICAL)
+        mid.add_setter(self.inbox.bar, "orientation", Gtk.Orientation.VERTICAL)
+        self.add_breakpoint(mid)
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 620sp"))
+        narrow.add_setter(self.library.bar, "orientation", Gtk.Orientation.VERTICAL)
+        narrow.add_setter(self.inbox.bar, "orientation", Gtk.Orientation.VERTICAL)
+        narrow.add_setter(self.switcher, "visible", False)
+        narrow.add_setter(self.switcher_bar, "reveal", True)
+        narrow.add_setter(self.library.art_btn, "label", "Arte faltante")
+        narrow.connect("apply", lambda *_: self._set_compact(True))
+        narrow.connect("unapply", lambda *_: self._set_compact(False))
+        self.add_breakpoint(narrow)
+
+        # ---- cerrar durante una copia: seguir en segundo plano
+        self.in_background = False
+        self.connect("close-request", self._on_close_request)
 
         for name, cb in (("settings", lambda *_: SettingsDialog(self).present(self)),
                          ("open-lib", lambda *_: os.path.isdir(self.cfg["library"]) and Gio.AppInfo.launch_default_for_uri(
@@ -1003,6 +1376,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.add_action(a)
         app.set_accels_for_action("win.reload", ["F5", "<Control>r"])
         app.set_accels_for_action("win.settings", ["<Control>comma"])
+        app.set_accels_for_action("window.close", ["<Control>w"])
         self.vstack.set_visible_child_name("library")
         self.reload_all()
 
@@ -1138,6 +1512,48 @@ class MainWindow(Adw.ApplicationWindow):
         self.library.reload()
         self.inbox.reload()
 
+    def _set_compact(self, on):
+        self.inbox.compact = on
+        self.inbox._update_btn()
+
+    def busy(self):
+        return self.inbox.importing or not self.library.art_btn.get_sensitive()
+
+    def _on_close_request(self, *_):
+        if self.busy() and self.cfg.get("background_on_close", True):
+            self.set_visible(False)
+            if not self.in_background:
+                self.in_background = True
+                self.get_application().hold()
+            n = Gio.Notification.new("OPL Manager sigue trabajando")
+            n.set_body("La copia continúa en segundo plano. Te aviso cuando termine.")
+            self.get_application().send_notification("background", n)
+            return True              # no cerrar todavía
+        return False
+
+    def come_back(self):
+        """Volver a mostrar la ventana (p. ej. al abrir la app otra vez mientras trabaja)."""
+        if self.in_background:
+            self.in_background = False
+            self.get_application().release()
+            self.get_application().withdraw_notification("background")
+        self.set_visible(True)
+        self.present()
+
+    def job_finished(self, title, body):
+        if self.in_background:
+            n = Gio.Notification.new(title)
+            n.set_body(body)
+            app = self.get_application()
+            app.send_notification("done", n)
+            app.withdraw_notification("background")
+            if not self.busy():      # ya no queda nada: ahora sí se cierra
+                self.in_background = False
+                app.release()
+                self.destroy()
+        else:
+            self.toast(body)
+
     def update_badge(self, n):
         self.inbox_page.set_needs_attention(n > 0)
         self.inbox_page.set_badge_number(n)
@@ -1168,8 +1584,11 @@ class App(Adw.Application):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def do_activate(self):
-        win = self.props.active_window or MainWindow(self)
-        win.present()
+        wins = self.get_windows()
+        if wins:
+            wins[0].come_back()
+        else:
+            MainWindow(self).present()
 
 
 if __name__ == "__main__":

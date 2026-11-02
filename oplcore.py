@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
     "max_name": 32,             # 0 = sin límite (OPL nuevo)
     "download_art": True,
     "sort": 0,                  # 0 nombre, 1 código, 2 tamaño, 3 más recientes
+    "trash_after_copy": False,  # mover a la papelera lo copiado de la bandeja
+    "background_on_close": True,  # al cerrar durante una copia, seguir en segundo plano
     "auto_update": True,        # buscar versiones nuevas al abrir (máx. 1 vez al día)
     "auto_install": True,       # instalarlas solas cuando no hace falta contraseña
     "last_update_check": 0,
@@ -592,20 +594,23 @@ def scan_inbox(root, library="", ps1_dir="CD"):
         solos = [f for f in rom_files if ext_of(f) in SOLO_EXT]
         multi = [f for f in rom_files if ext_of(f) not in SOLO_EXT]
         rel = os.path.relpath(folder, root)
+        game_folder = folder if (folder != root and os.path.basename(folder) not in ("DVD", "PS1", "CD", "POPS")) else ""
+        base_extra = {"root": root, "folder": folder, "game_folder": game_folder}
         for f in solos:
             console, gid, guessed = _classify([f])
             stem = strip_id(os.path.splitext(os.path.basename(f))[0])
             title = title_hint if (title_hint and len(rom_files) == 1) else stem
             items.append(InboxItem([f], console, gid or id_from_name(os.path.basename(f)), title,
                                    os.path.getsize(f), rel, covers[0] if covers else "", busy,
-                                   False, guessed=guessed))
+                                   False, guessed=guessed, extra=dict(base_extra)))
         for grp in (group_multi(multi) if multi else []):
             # .cue primero, luego los .bin
             grp.sort(key=lambda p: (ext_of(p) not in ("cue", "m3u", "mds", "ccd"), p.lower()))
             console, gid, guessed = _classify(grp)
             stem = os.path.splitext(os.path.basename(grp[0]))[0]
             items.append(InboxItem(grp, console, gid, stem, sum(os.path.getsize(x) for x in grp),
-                                   rel, covers[0] if covers else "", busy, True, guessed=guessed))
+                                   rel, covers[0] if covers else "", busy, True, guessed=guessed,
+                                   extra=dict(base_extra)))
 
     if not os.path.isdir(root):
         return items
@@ -648,6 +653,49 @@ def scan_inbox(root, library="", ps1_dir="CD"):
             it.extra["inbox_art"] = {t: p for t in ART_TYPES
                                      if os.path.exists(p := os.path.join(root, "ART", f"{it.gid}_{t}.png"))}
     return items
+
+
+def cleanup_targets(items):
+    """Qué mandar a la papelera para quitar estos juegos de la bandeja.
+    Si un juego está en su propia carpeta (p. ej. "Killer7 [PAL]/") y en ella no queda ningún otro
+    juego, se elimina la carpeta entera (con sus .url, .txt, portadas...). Si no, solo sus archivos.
+    Devuelve una lista de rutas (carpetas o archivos), sin repetidos ni rutas anidadas."""
+    files = {os.path.realpath(f) for it in items for f in it.files}
+    by_folder = {}
+    for it in items:
+        gf = it.extra.get("game_folder", "")
+        by_folder.setdefault(gf, []).append(it)
+    targets = []
+    for gf, its in by_folder.items():
+        if gf and os.path.isdir(gf):
+            roms_in_folder = {os.path.realpath(os.path.join(dp, n))
+                              for dp, _d, fn in os.walk(gf) for n in fn if ext_of(n) in ROM_EXT}
+            if roms_in_folder <= files:          # no queda ningún otro juego dentro
+                targets.append(gf)
+                continue
+        for it in its:
+            targets += [f for f in it.files if os.path.exists(f)]
+    # sin rutas dentro de otra ya incluida
+    targets = sorted(set(targets), key=len)
+    out = []
+    for t in targets:
+        if not any(t.startswith(o.rstrip("/") + "/") for o in out):
+            out.append(t)
+    return out
+
+
+def game_art_files(game, all_games):
+    """Imágenes de ART/ de este juego, solo si ningún otro juego de la biblioteca usa el mismo código."""
+    if not game.gid or any(g is not game and g.gid == game.gid for g in all_games):
+        return []
+    return [p for t in ART_TYPES if (p := game.art(t))]
+
+
+def path_size(path):
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    return sum(os.path.getsize(os.path.join(dp, n)) for dp, _d, fn in os.walk(path) for n in fn
+               if os.path.isfile(os.path.join(dp, n)))
 
 
 def _copy_file(src, dst, progress=None, done_before=0, total=0):
