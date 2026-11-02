@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""OPL Manager para Linux — gestor de la biblioteca de Open PS2 Loader (GTK 4 + libadwaita)."""
+import os
+import subprocess
+import sys
+import threading
+import traceback
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import oplcore as core  # noqa: E402
+
+APP_ID = "io.github.camiloferreira.OplManager"
+COVER_W, COVER_H = 140, 200
+
+CSS = b"""
+.game-card { padding: 6px; border-radius: 12px; }
+.game-card:hover { background: alpha(currentColor, 0.07); }
+.cover { border-radius: 6px; background: alpha(currentColor, 0.08); }
+.cover-missing { border-radius: 6px; background: alpha(currentColor, 0.08); }
+.game-title { font-weight: 600; }
+.art-thumb { border-radius: 4px; background: alpha(currentColor, 0.06); }
+"""
+
+
+def run_bg(fn, on_done=None, on_error=None):
+    """Ejecuta fn en un hilo; on_done(resultado) / on_error(excepción) en el hilo de la UI."""
+    def worker():
+        try:
+            res = fn()
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            if on_error:
+                GLib.idle_add(on_error, e)
+            return
+        if on_done:
+            GLib.idle_add(on_done, res)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def cover_widget(path, w=COVER_W, h=COVER_H, label=""):
+    if path and os.path.exists(path):
+        try:
+            # se carga ya reducida: tamaño fijo en la grilla y menos memoria
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, w, h, False)
+            pic = Gtk.Picture.new_for_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        except GLib.Error:
+            pic = None
+        if pic:
+            pic.set_content_fit(Gtk.ContentFit.FILL)
+            pic.set_can_shrink(True)
+            pic.set_size_request(w, h)
+            pic.set_halign(Gtk.Align.CENTER)
+            pic.set_valign(Gtk.Align.START)
+            pic.add_css_class("cover")
+            frame = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.START, overflow=Gtk.Overflow.HIDDEN,
+                            width_request=w, height_request=h)
+            frame.append(pic)
+            return frame
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
+    box.set_size_request(w, h)
+    box.add_css_class("cover-missing")
+    img = Gtk.Image.new_from_icon_name("media-optical-symbolic")
+    img.set_pixel_size(min(w, h) // 3)
+    img.set_vexpand(True)
+    img.add_css_class("dim-label")
+    box.append(img)
+    if label:
+        lb = Gtk.Label(label=label, margin_bottom=8)
+        lb.add_css_class("caption")
+        lb.add_css_class("dim-label")
+        box.append(lb)
+    return box
+
+
+# =============================================================== Biblioteca
+class LibraryPage(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.win = win
+        self.games = []
+        self.filter_text = ""
+
+        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
+        self.search = Gtk.SearchEntry(placeholder_text="Buscar juego o código…", hexpand=True)
+        self.search.connect("search-changed", self._on_search)
+        bar.append(self.search)
+        self.kind = Gtk.DropDown.new_from_strings(["Todos", "PS2 (DVD/CD)", "PS1 (POPS)", "Sin portada"])
+        self.kind.connect("notify::selected", lambda *_: self.flow.invalidate_filter())
+        bar.append(self.kind)
+        self.sort = Gtk.DropDown.new_from_strings(core.SORT_NAMES)
+        self.sort.set_tooltip_text("Ordenar por")
+        self.sort.set_selected(int(win.cfg.get("sort", 0) or 0))
+        self.sort.connect("notify::selected", self._on_sort)
+        bar.append(self.sort)
+        self.dup_btn = Gtk.Button(visible=False, tooltip_text="Juegos repetidos (mismo código)")
+        self.dup_btn.add_css_class("destructive-action")
+        self.dup_btn.connect("clicked", lambda *_: DuplicatesDialog(self.win, self.dups).present(self.win))
+        bar.append(self.dup_btn)
+        self.dups = []
+        self.art_btn = Gtk.Button(label="Descargar arte faltante", tooltip_text="Baja portadas, lomos, fondos y capturas que falten. No sobrescribe nada.")
+        self.art_btn.connect("clicked", self._download_all_art)
+        bar.append(self.art_btn)
+        self.append(bar)
+
+        self.status = Gtk.Label(xalign=0, margin_start=14, margin_bottom=4)
+        self.status.add_css_class("dim-label")
+        self.status.add_css_class("caption")
+        self.append(self.status)
+
+        self.progress = Gtk.ProgressBar(margin_start=12, margin_end=12, visible=False, show_text=True)
+        self.append(self.progress)
+
+        self.flow = Gtk.FlowBox(valign=Gtk.Align.START, selection_mode=Gtk.SelectionMode.NONE,
+                                homogeneous=True, min_children_per_line=2, max_children_per_line=20,
+                                column_spacing=6, row_spacing=6, margin_start=12, margin_end=12,
+                                margin_top=6, margin_bottom=12)
+        self.flow.set_filter_func(self._filter)
+        self.flow.set_sort_func(lambda a, b: (lambda x, y: (x > y) - (x < y))(
+            core.sort_key(a.game, self.sort.get_selected()), core.sort_key(b.game, self.sort.get_selected())))
+        self.stack = Gtk.Stack()
+        sc = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_child(self.flow)
+        self.stack.add_named(sc, "grid")
+        self.empty = Adw.StatusPage(icon_name="media-optical-symbolic", title="Sin juegos",
+                                    description="Elige la carpeta de tu biblioteca OPL en Ajustes.")
+        find = Gtk.Button(label="Buscar pendrive o disco OPL", halign=Gtk.Align.CENTER)
+        find.add_css_class("pill")
+        find.add_css_class("suggested-action")
+        find.connect("clicked", lambda *_: DriveDialog(self.win).present(self.win))
+        self.empty.set_child(find)
+        self.stack.add_named(self.empty, "empty")
+        self.loading = Adw.StatusPage(title="Cargando biblioteca…")
+        sp = Gtk.Spinner(spinning=True, width_request=32, height_request=32, halign=Gtk.Align.CENTER)
+        self.loading.set_child(sp)
+        self.stack.add_named(self.loading, "loading")
+        self.append(self.stack)
+
+    # ---- carga
+    def reload(self):
+        lib = self.win.cfg["library"]
+        self.stack.set_visible_child_name("loading")
+        if not os.path.isdir(lib):
+            self.empty.set_title("Biblioteca no conectada")
+            self.empty.set_description(f"No se encuentra:\n{lib}\n\nConecta tu pendrive o disco de OPL, o búscalo.")
+            self.stack.set_visible_child_name("empty")
+            self.status.set_text("")
+            return
+        run_bg(lambda: core.scan_library(lib), self._loaded,
+               lambda e: self.win.toast(f"Error al leer la biblioteca: {e}"))
+
+    def _loaded(self, games):
+        self.games = games
+        while (c := self.flow.get_first_child()):
+            self.flow.remove(c)
+        for g in games:
+            self.flow.append(self._card(g))
+        lib = self.win.cfg["library"]
+        n_ps2 = sum(g.kind != "POPS" for g in games)
+        n_ps1 = sum(g.kind == "POPS" for g in games)
+        no_cov = sum(1 for g in games if g.kind != "POPS" and not g.art("COV"))
+        self.status.set_text(f"{lib}  ·  {n_ps2} PS2  ·  {n_ps1} PS1  ·  {no_cov} sin portada  ·  "
+                             f"{core.human_size(core.disk_free(lib))} libres")
+        self.dups = core.find_duplicates(games)
+        n_extra = sum(len(gs) - 1 for gs in self.dups)
+        self.dup_btn.set_label(f"Duplicados ({n_extra})")
+        self.dup_btn.set_visible(bool(self.dups))
+        self.empty.set_title("Sin juegos")
+        self.empty.set_description("No hay juegos en DVD/, CD/ ni POPS/. Cópialos desde la Bandeja de entrada.")
+        self.stack.set_visible_child_name("grid" if games else "empty")
+        self.flow.invalidate_filter()
+
+    def _card(self, g):
+        btn = Gtk.Button(halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
+        btn.add_css_class("flat")
+        btn.add_css_class("game-card")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(cover_widget(g.art("COV"), label=g.kind))
+        t = Gtk.Label(label=g.title, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=16, lines=2,
+                      ellipsize=Pango.EllipsizeMode.END, justify=Gtk.Justification.CENTER)
+        t.add_css_class("game-title")
+        t.set_size_request(COVER_W, -1)
+        box.append(t)
+        sub = Gtk.Label(label=f"{g.gid or g.kind}")
+        sub.add_css_class("caption")
+        sub.add_css_class("dim-label")
+        box.append(sub)
+        btn.set_child(box)
+        btn.set_tooltip_text(f"{g.filename}\n{core.human_size(g.size)}")
+        btn.connect("clicked", lambda *_: GameDialog(self.win, g).present(self.win))
+        child = Gtk.FlowBoxChild(child=btn)
+        child.game = g
+        return child
+
+    def _on_sort(self, *_):
+        self.win.cfg["sort"] = int(self.sort.get_selected())
+        core.save_config(self.win.cfg)
+        self.flow.invalidate_sort()
+
+    def _on_search(self, entry):
+        self.filter_text = entry.get_text().lower().strip()
+        self.flow.invalidate_filter()
+
+    def _filter(self, child):
+        g = child.game
+        k = self.kind.get_selected()
+        if k == 1 and g.kind == "POPS":
+            return False
+        if k == 2 and g.kind != "POPS":
+            return False
+        if k == 3 and (g.kind == "POPS" or g.art("COV")):
+            return False
+        if self.filter_text:
+            return self.filter_text in f"{g.title} {g.gid} {g.filename}".lower()
+        return True
+
+    # ---- arte de toda la biblioteca
+    def _download_all_art(self, *_):
+        todo = [g for g in self.games if g.gid and g.kind != "POPS" and g.missing_art()]
+        if not todo:
+            self.win.toast("Todos los juegos ya tienen su arte")
+            return
+        lib = self.win.cfg["library"]
+        self.art_btn.set_sensitive(False)
+        self.progress.set_visible(True)
+
+        def work():
+            total = 0
+            seen = set()
+            for i, g in enumerate(todo):
+                GLib.idle_add(self._art_progress, i, len(todo), g.title)
+                if g.gid in seen:
+                    continue
+                seen.add(g.gid)
+                total += len(core.download_art(lib, g.gid, g.missing_art()))
+            return total
+
+        def done(total):
+            self.art_btn.set_sensitive(True)
+            self.progress.set_visible(False)
+            self.win.toast(f"Se descargaron {total} imágenes")
+            self.reload()
+
+        def err(e):
+            self.art_btn.set_sensitive(True)
+            self.progress.set_visible(False)
+            self.win.toast(f"Error al descargar: {e}")
+        run_bg(work, done, err)
+
+    def _art_progress(self, i, n, title):
+        self.progress.set_fraction(i / max(n, 1))
+        self.progress.set_text(f"Arte {i + 1}/{n}: {title}")
+
+
+# =============================================================== Duplicados
+class DuplicatesDialog(Adw.Dialog):
+    """Elige qué copia conservar de cada juego repetido; las demás van a la papelera."""
+
+    def __init__(self, win, groups):
+        super().__init__(title="Juegos duplicados", content_width=760, content_height=640)
+        self.win = win
+        self.choices = []      # [(grupo, [CheckButton...])]
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage(description=(
+            "Estos juegos tienen el mismo código. Elige cuál conservar de cada uno; "
+            "las otras copias se mueven a la papelera (puedes recuperarlas desde Archivos). "
+            "Ojo: un parche o mod en español suele tener el mismo código que el original."))
+        for gs in groups:
+            grp = Adw.PreferencesGroup(title=GLib.markup_escape_text(f"{gs[0].title}"),
+                                       description=gs[0].gid)
+            leader = None
+            checks = []
+            for i, g in enumerate(gs):
+                when = GLib.DateTime.new_from_unix_local(int(g.mtime)).format("%d/%m/%Y") if g.mtime else "—"
+                row = Adw.ActionRow(title=GLib.markup_escape_text(g.filename),
+                                    subtitle=f"{g.kind}/  ·  {core.human_size(g.size)}  ·  {when}"
+                                             + ("  ·  sugerido" if i == 0 else ""))
+                chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=(i == 0))
+                if leader:
+                    chk.set_group(leader)
+                else:
+                    leader = chk
+                chk.connect("toggled", lambda *_: self._update())
+                row.add_prefix(chk)
+                row.set_activatable_widget(chk)
+                checks.append(chk)
+                grp.add(row)
+            self.choices.append((gs, checks))
+            page.add(grp)
+        tv.set_content(page)
+
+        bottom = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8,
+                         halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancelar")
+        cancel.connect("clicked", lambda *_: self.close())
+        self.go = Gtk.Button()
+        self.go.add_css_class("destructive-action")
+        self.go.connect("clicked", self._confirm)
+        bottom.append(cancel)
+        bottom.append(self.go)
+        tv.add_bottom_bar(bottom)
+        self.set_child(tv)
+        self._update()
+
+    def _to_remove(self):
+        out = []
+        for gs, checks in self.choices:
+            out += [g for g, c in zip(gs, checks) if not c.get_active()]
+        return out
+
+    def _update(self):
+        rm = self._to_remove()
+        self.go.set_label(f"Mover {len(rm)} a la papelera ({core.human_size(sum(g.size for g in rm))})")
+        self.go.set_sensitive(bool(rm))
+
+    def _confirm(self, *_):
+        rm = self._to_remove()
+        body = "\n".join(f"• {g.filename}" for g in rm[:15]) + (f"\n… y {len(rm) - 15} más" if len(rm) > 15 else "")
+        ask = Adw.AlertDialog(heading=f"¿Mover {len(rm)} archivo(s) a la papelera?", body=body)
+        ask.add_response("cancel", "Cancelar")
+        ask.add_response("ok", "Mover a la papelera")
+        ask.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        ask.set_default_response("cancel")
+        ask.connect("response", lambda _d, r: r == "ok" and self._trash(rm))
+        ask.present(self)
+
+    def _trash(self, rm):
+        self.go.set_sensitive(False)
+        self.go.set_label("Moviendo…")
+
+        def work():
+            done, errors = 0, []
+            for g in rm:
+                try:
+                    Gio.File.new_for_path(g.path).trash(None)
+                    done += 1
+                except GLib.Error as e:
+                    errors.append(f"{g.filename}: {e.message}")
+            return done, errors
+
+        def finished(res):
+            done, errors = res
+            if errors:
+                al = Adw.AlertDialog(heading="Algunos archivos no se movieron",
+                                     body="No se borró nada de forma permanente.\n\n" + "\n".join(errors))
+                al.add_response("ok", "Aceptar")
+                al.present(self.win)
+            self.win.toast(f"{done} duplicado(s) movidos a la papelera")
+            self.close()
+            self.win.reload_all()
+        run_bg(work, finished)
+
+
+# =============================================================== Detalle de un juego
+class GameDialog(Adw.Dialog):
+    def __init__(self, win, game):
+        super().__init__(title=game.title, content_width=640, content_height=620)
+        self.win = win
+        self.g = game
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_start=18, margin_end=18,
+                       margin_top=6, margin_bottom=18)
+        sc.set_child(page)
+        tv.set_content(sc)
+        self.set_child(tv)
+
+        top = Gtk.Box(spacing=18)
+        top.append(cover_widget(game.art("COV"), 168, 240, game.kind))
+        info = Adw.PreferencesGroup(hexpand=True)
+        for title, val in (("Código", game.gid or "—"), ("Carpeta", game.kind),
+                           ("Tamaño", core.human_size(game.size)), ("Archivo", game.filename)):
+            row = Adw.ActionRow(title=title, subtitle=val, subtitle_selectable=True)
+            row.add_css_class("property")
+            info.add(row)
+        top.append(info)
+        page.append(top)
+
+        grp = Adw.PreferencesGroup(title="Nombre en OPL",
+                                   description=self._name_hint())
+        self.name_row = Adw.EntryRow(title="Nombre del juego", text=game.title, show_apply_button=True)
+        self.name_row.connect("apply", self._rename)
+        self.name_row.connect("changed", lambda r: grp.set_description(self._name_hint(r.get_text())))
+        grp.add(self.name_row)
+        self.name_grp = grp
+        page.append(grp)
+
+        acts = Gtk.Box(spacing=8, halign=Gtk.Align.START)
+        b1 = Gtk.Button(label="Descargar arte", sensitive=bool(game.gid))
+        b1.connect("clicked", self._download_art)
+        b2 = Gtk.Button(label="Cambiar portada…", sensitive=bool(game.gid))
+        b2.connect("clicked", self._change_cover)
+        b3 = Gtk.Button(label="Abrir carpeta")
+        b3.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
+            GLib.filename_to_uri(os.path.dirname(game.path)), None))
+        for b in (b1, b2, b3):
+            acts.append(b)
+        page.append(acts)
+
+        if game.gid:
+            ag = Adw.PreferencesGroup(title="Arte en ART/")
+            fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
+                             min_children_per_line=2, column_spacing=8, row_spacing=8)
+            for t, label in core.ART_LABELS.items():
+                p = game.art(t)
+                b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                pic = None
+                if p:
+                    try:
+                        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(p, 130, 100, True)
+                        pic = Gtk.Picture.new_for_paintable(Gdk.Texture.new_for_pixbuf(pb))
+                    except GLib.Error:
+                        pic = None
+                if pic:
+                    pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+                    pic.set_size_request(130, 100)
+                    pic.add_css_class("art-thumb")
+                    b.append(pic)
+                else:
+                    ph = Gtk.Label(label="falta", width_request=130, height_request=100)
+                    ph.add_css_class("art-thumb")
+                    ph.add_css_class("dim-label")
+                    b.append(ph)
+                lb = Gtk.Label(label=label)
+                lb.add_css_class("caption")
+                b.append(lb)
+                fb.append(b)
+            ag.add(fb)
+            page.append(ag)
+
+    def _name_hint(self, text=None):
+        text = self.g.title if text is None else text
+        ml = int(self.win.cfg.get("max_name", 32) or 0)
+        final = core.opl_filename(self.g.gid, text, core.ext_of(self.g.path), ml)
+        return f"Quedará como: {final}"
+
+    def _rename(self, row):
+        try:
+            new = core.rename_game(self.g, row.get_text(), int(self.win.cfg.get("max_name", 32) or 0))
+        except Exception as e:  # noqa: BLE001
+            self.win.toast(f"No se pudo renombrar: {e}")
+            return
+        self.win.toast(f"Renombrado a {os.path.basename(new)}")
+        self.close()
+        self.win.library.reload()
+
+    def _download_art(self, btn):
+        btn.set_sensitive(False)
+        btn.set_label("Descargando…")
+        lib = self.win.cfg["library"]
+
+        def done(got):
+            self.win.toast(f"{len(got)} imágenes nuevas" if got else "No había arte nuevo en la base")
+            self.close()
+            self.win.library.reload()
+        run_bg(lambda: core.download_art(lib, self.g.gid), done,
+               lambda e: (btn.set_sensitive(True), btn.set_label("Descargar arte"), self.win.toast(f"Error: {e}")))
+
+    def _change_cover(self, *_):
+        d = Gtk.FileDialog(title="Elegir portada")
+        f = Gtk.FileFilter(name="Imágenes")
+        f.add_mime_type("image/*")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        d.set_filters(store)
+
+        def chosen(dialog, res):
+            try:
+                file = dialog.open_finish(res)
+            except GLib.Error:
+                return
+            path = file.get_path()
+            if self.g.art("COV"):
+                ask = Adw.AlertDialog(heading="¿Reemplazar la portada?",
+                                      body="Este juego ya tiene portada. La actual se guardará como _COV.png.bak.")
+                ask.add_response("cancel", "Cancelar")
+                ask.add_response("ok", "Reemplazar")
+                ask.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+                ask.connect("response", lambda _d, r: r == "ok" and self._save_cover(path, True))
+                ask.present(self)
+            else:
+                self._save_cover(path, False)
+        d.open(self.win, None, chosen)
+
+    def _save_cover(self, path, replace):
+        try:
+            if replace:
+                cur = self.g.art("COV")
+                bak = core.free_path(cur + ".bak")
+                os.rename(cur, bak)            # nunca se borra: queda como respaldo
+            core.save_cover(self.g.library, self.g.gid, path)
+        except Exception as e:  # noqa: BLE001
+            self.win.toast(f"No se pudo guardar la portada: {e}")
+            return
+        self.win.toast("Portada guardada")
+        self.close()
+        self.win.library.reload()
+
+
+# =============================================================== Bandeja de entrada
+class InboxPage(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.win = win
+        self.items = []
+        self.checks = []
+        self.importing = False
+
+        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
+        self.status = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.status.add_css_class("dim-label")
+        self.status.add_css_class("caption")
+        bar.append(self.status)
+        add = Gtk.Button(icon_name="folder-new-symbolic", tooltip_text="Agregar carpeta de ROMs del equipo")
+        add.connect("clicked", lambda *_: self.win.add_inbox_folder())
+        bar.append(add)
+        sel = Gtk.Button(label="Seleccionar nuevos")
+        sel.connect("clicked", self._select_new)
+        bar.append(sel)
+        self.import_btn = Gtk.Button(label="Copiar a la biblioteca")
+        self.import_btn.add_css_class("suggested-action")
+        self.import_btn.connect("clicked", self._import)
+        bar.append(self.import_btn)
+        self.append(bar)
+
+        self.progress = Gtk.ProgressBar(margin_start=12, margin_end=12, visible=False, show_text=True)
+        self.append(self.progress)
+
+        self.stack = Gtk.Stack(vexpand=True)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=6, margin_bottom=12)
+        self.list.add_css_class("boxed-list")
+        clamp = Adw.Clamp(maximum_size=900, child=self.list, margin_start=12, margin_end=12)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_child(clamp)
+        self.stack.add_named(sc, "list")
+        self.empty = Adw.StatusPage(icon_name="folder-download-symbolic", title="Bandeja vacía",
+                                    description="No hay juegos nuevos en la carpeta de descargas.")
+        addb = Gtk.Button(label="Agregar carpeta de ROMs…", halign=Gtk.Align.CENTER)
+        addb.add_css_class("pill")
+        addb.connect("clicked", lambda *_: self.win.add_inbox_folder())
+        self.empty.set_child(addb)
+        self.stack.add_named(self.empty, "empty")
+        self.loading = Adw.StatusPage(title="Revisando descargas…")
+        self.loading.set_child(Gtk.Spinner(spinning=True, width_request=32, height_request=32, halign=Gtk.Align.CENTER))
+        self.stack.add_named(self.loading, "loading")
+        self.append(self.stack)
+
+        note = Gtk.Label(wrap=True, xalign=0, margin_start=14, margin_end=14, margin_bottom=8,
+                         label="Se copian (no se mueven): en la bandeja no se borra nada y en la biblioteca nunca se "
+                               "sobrescribe. Los PS2 van a DVD/ con nombre OPL; los .bin/.cue van a la carpeta de PS1 "
+                               "elegida en Ajustes, con su nombre original.")
+        note.add_css_class("caption")
+        note.add_css_class("dim-label")
+        self.append(note)
+
+    def reload(self):
+        if self.importing:
+            return
+        roots, lib = list(self.win.cfg.get("inboxes") or []), self.win.cfg["library"]
+        self.stack.set_visible_child_name("loading")
+        self.status.set_text("  ·  ".join(roots))
+        self.status.set_tooltip_text("\n".join(roots))
+        if not roots:
+            self.empty.set_title("Sin carpetas de ROMs")
+            self.empty.set_description("Agrega la carpeta de descargas o donde guardas tus ROMs.")
+            self.stack.set_visible_child_name("empty")
+            return
+        run_bg(lambda: core.scan_inboxes(roots, lib, self.win.cfg.get("ps1_dir") or "CD"), self._loaded,
+               lambda e: self.win.toast(f"Error al leer la bandeja: {e}"))
+
+    def _loaded(self, res):
+        items, missing = res
+        self.missing = missing
+        self.items = items
+        self.checks = []
+        while (r := self.list.get_first_child()):
+            self.list.remove(r)
+        for it in items:
+            self.list.append(self._row(it))
+        new = sum(1 for i in items if not i.in_library and not i.busy)
+        n = len(self.win.cfg.get("inboxes") or [])
+        txt = f"{n} carpeta(s) de ROMs  ·  {len(items)} juegos  ·  {new} nuevos"
+        if missing:
+            txt += f"  ·  ⚠ {len(missing)} carpeta(s) no encontrada(s)"
+        self.status.set_text(txt)
+        self.empty.set_title("Bandeja vacía")
+        self.empty.set_description("No hay juegos en tus carpetas de ROMs."
+                                   + (f"\n\nNo se encuentran:\n" + "\n".join(missing) if missing else ""))
+        self.stack.set_visible_child_name("list" if items else "empty")
+        self._update_btn()
+        self.win.update_badge(new)
+
+    def _final_name(self, it):
+        if it.multi:
+            return ", ".join(os.path.basename(f) for f in it.files[:2]) + (" …" if len(it.files) > 2 else "")
+        return core.opl_filename(it.gid, it.title, core.ext_of(it.main), int(self.win.cfg.get("max_name", 32) or 0))
+
+    def _row(self, it):
+        row = Adw.ActionRow(title=GLib.markup_escape_text(self._final_name(it)), title_lines=2)
+        dest = "DVD" if (it.console == "PS2" and not it.multi) else (self.win.cfg.get("ps1_dir") or "CD")
+        bits = [it.console + (" (adivinado)" if it.guessed else ""), it.gid or "sin código",
+                core.human_size(it.size), f"→ {dest}/", f"desde {it.origin}"]
+        if it.busy:
+            bits.insert(0, "⏳ extrayéndose")
+        if it.in_library:
+            bits.insert(0, "✔ ya en la biblioteca")
+        row.set_subtitle(GLib.markup_escape_text("  ·  ".join(bits)))
+        row.set_subtitle_lines(2)
+
+        chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=not it.in_library and not it.busy,
+                              sensitive=not it.busy and not it.in_library)
+        chk.connect("toggled", lambda *_: self._update_btn())
+        chk.item = it
+        self.checks.append(chk)
+        row.add_prefix(chk)
+        row.set_activatable_widget(chk)
+
+        thumb = it.cover or it.extra.get("inbox_art", {}).get("COV", "")
+        row.add_prefix(cover_widget(thumb, 42, 60))
+
+        if not it.multi:
+            ed = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Cambiar nombre")
+            ed.add_css_class("flat")
+            ed.connect("clicked", lambda *_: self._edit_title(it, row))
+            row.add_suffix(ed)
+        return row
+
+    def _edit_title(self, it, row):
+        dlg = Adw.AlertDialog(heading="Nombre del juego")
+        entry = Gtk.Entry(text=it.title, activates_default=True)
+        hint = Gtk.Label(xalign=0, wrap=True)
+        hint.add_css_class("caption")
+        hint.add_css_class("dim-label")
+        ml = int(self.win.cfg.get("max_name", 32) or 0)
+
+        def upd(*_):
+            hint.set_text("Quedará como: " + core.opl_filename(it.gid, entry.get_text(), core.ext_of(it.main), ml))
+        entry.connect("changed", upd)
+        upd()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(entry)
+        box.append(hint)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("ok", "Guardar")
+        dlg.set_default_response("ok")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+
+        def resp(_d, r):
+            if r == "ok" and entry.get_text().strip():
+                it.title = entry.get_text().strip()
+                row.set_title(GLib.markup_escape_text(self._final_name(it)))
+        dlg.connect("response", resp)
+        dlg.present(self.win)
+
+    def _selected(self):
+        return [c.item for c in self.checks if c.get_active() and c.get_sensitive()]
+
+    def _update_btn(self):
+        sel = self._selected()
+        size = sum(i.size for i in sel)
+        self.import_btn.set_label(f"Copiar a la biblioteca ({len(sel)} · {core.human_size(size)})" if sel
+                                  else "Copiar a la biblioteca")
+        self.import_btn.set_sensitive(bool(sel) and not self.importing)
+
+    def _select_new(self, *_):
+        for c in self.checks:
+            if c.get_sensitive():
+                c.set_active(not c.item.in_library)
+
+    def _import(self, *_):
+        sel = self._selected()
+        lib = self.win.cfg["library"]
+        if not sel:
+            return
+        if not os.path.isdir(lib):
+            self.win.toast("La biblioteca no está disponible (¿disco conectado?)")
+            return
+        need = sum(i.size for i in sel)
+        if core.disk_free(lib) < need:
+            self.win.toast(f"No hay espacio: hacen falta {core.human_size(need)}")
+            return
+        self.importing = True
+        self._update_btn()
+        self.progress.set_visible(True)
+        cfg = dict(self.win.cfg)
+
+        def work():
+            ok, errors, art = 0, [], 0
+            for n, it in enumerate(sel):
+                name = it.title
+
+                def prog(done, total, n=n, name=name):
+                    GLib.idle_add(self._prog, n, len(sel), name, done, total)
+                try:
+                    _copied, got = core.import_item(it, cfg, prog)
+                    ok += 1
+                    art += len(got)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{name}: {e}")
+            return ok, errors, art
+
+        def done(res):
+            ok, errors, art = res
+            self.importing = False
+            self.progress.set_visible(False)
+            msg = f"{ok} juego(s) copiados, {art} imágenes de arte"
+            if errors:
+                msg += f" · {len(errors)} con error"
+                al = Adw.AlertDialog(heading="Algunos juegos no se copiaron", body="\n".join(errors))
+                al.add_response("ok", "Aceptar")
+                al.present(self.win)
+            self.win.toast(msg)
+            self.reload()
+            self.win.library.reload()
+        run_bg(work, done)
+
+    def _prog(self, n, total_items, name, done, total):
+        frac = done / total if total else 1
+        self.progress.set_fraction((n + frac) / total_items)
+        self.progress.set_text(f"{n + 1}/{total_items}  {name}  —  {core.human_size(done)} de {core.human_size(total)}")
+
+
+# =============================================================== Buscar pendrive / disco OPL
+class DriveDialog(Adw.Dialog):
+    def __init__(self, win, on_pick=None):
+        super().__init__(title="Pendrive o disco de OPL", content_width=620, content_height=520)
+        self.win = win
+        self.on_pick = on_pick
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        again = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Volver a buscar")
+        again.connect("clicked", lambda *_: self.scan())
+        hb.pack_start(again)
+        tv.add_top_bar(hb)
+        self.stack = Gtk.Stack()
+        self.page = Adw.PreferencesPage()
+        self.stack.add_named(self.page, "list")
+        self.none = Adw.StatusPage(icon_name="drive-removable-media-symbolic", title="No hay unidades conectadas",
+                                   description="Conecta el pendrive o disco de tu PS2 y pulsa ↻.")
+        self.stack.add_named(self.none, "none")
+        tv.set_content(self.stack)
+        self.set_child(tv)
+        self.groups = []
+        self.scan()
+
+    def scan(self):
+        for g in self.groups:
+            self.page.remove(g)
+        self.groups = []
+        run_bg(core.find_opl_drives, self._show)
+
+    def _show(self, drives):
+        if not drives:
+            self.stack.set_visible_child_name("none")
+            return
+        self.stack.set_visible_child_name("list")
+        cur = os.path.realpath(self.win.cfg.get("library") or "")
+        opl = [d for d in drives if d["is_opl"]]
+        other = [d for d in drives if not d["is_opl"]]
+        for title, desc, lst in (
+                ("Con OPL", "Unidades que ya tienen carpetas de Open PS2 Loader", opl),
+                ("Otras unidades", "Al copiar juegos se crearán DVD/ y ART/ en ellas", other)):
+            if not lst:
+                continue
+            g = Adw.PreferencesGroup(title=title, description=desc)
+            for d in lst:
+                bits = []
+                if d["is_opl"]:
+                    bits.append(f"{d['games']} juegos")
+                bits.append(f"{core.human_size(d['free'])} libres de {core.human_size(d['total'])}")
+                bits.append(d["fs"])
+                if d["fs"] in ("vfat", "msdos"):
+                    bits.append("FAT32: máx. 4 GB por archivo")
+                row = Adw.ActionRow(title=GLib.markup_escape_text(d["label"]),
+                                    subtitle=GLib.markup_escape_text(f"{d['path']}\n" + "  ·  ".join(bits)),
+                                    subtitle_lines=3)
+                icon = Gtk.Image.new_from_icon_name("media-optical-symbolic" if d["is_opl"] else "drive-harddisk-symbolic")
+                row.add_prefix(icon)
+                if os.path.realpath(d["path"]) == cur:
+                    lb = Gtk.Label(label="En uso", valign=Gtk.Align.CENTER)
+                    lb.add_css_class("dim-label")
+                    row.add_suffix(lb)
+                else:
+                    b = Gtk.Button(label="Usar", valign=Gtk.Align.CENTER)
+                    if d["is_opl"]:
+                        b.add_css_class("suggested-action")
+                    b.connect("clicked", lambda *_a, p=d["path"]: self._pick(p))
+                    row.add_suffix(b)
+                    row.set_activatable_widget(b)
+                g.add(row)
+            self.page.add(g)
+            self.groups.append(g)
+
+    def _pick(self, path):
+        self.win.set_library(path)
+        if self.on_pick:
+            self.on_pick(path)
+        self.close()
+
+
+# =============================================================== Ajustes
+class SettingsDialog(Adw.PreferencesDialog):
+    def __init__(self, win):
+        super().__init__(title="Ajustes")
+        self.win = win
+        cfg = win.cfg
+        page = Adw.PreferencesPage(title="General", icon_name="emblem-system-symbolic")
+        self.add(page)
+
+        g1 = Adw.PreferencesGroup(title="Biblioteca OPL",
+                                  description="Pendrive o disco de la PS2 (donde están DVD/, CD/, POPS/, ART/)")
+        self.lib_row = self._folder_row("Carpeta de la biblioteca", "library",
+                                        "Raíz del disco de OPL (donde están DVD/, CD/, POPS/, ART/)")
+        srch = Gtk.Button(icon_name="system-search-symbolic", valign=Gtk.Align.CENTER,
+                          tooltip_text="Buscar pendrive o disco OPL conectado")
+        srch.add_css_class("flat")
+        srch.connect("clicked", lambda *_: DriveDialog(self.win, on_pick=lambda p: self.lib_row.set_subtitle(p)).present(self))
+        self.lib_row.add_suffix(srch)
+        g1.add(self.lib_row)
+        ps1 = Adw.EntryRow(title="Carpeta de la biblioteca para .bin/.cue de PS1", text=cfg.get("ps1_dir") or "CD",
+                           show_apply_button=True)
+        ps1.connect("apply", lambda r: self._set("ps1_dir", r.get_text().strip().strip("/") or "CD"))
+        g1.add(ps1)
+        page.add(g1)
+
+        self.g_in = Adw.PreferencesGroup(title="Carpetas de ROMs (bandeja de entrada)",
+                                         description="Se revisan todas buscando juegos para copiar a la biblioteca. "
+                                                     "Quitar una de la lista no borra ningún archivo.")
+        addf = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Agregar carpeta")
+        addf.add_css_class("flat")
+        addf.connect("clicked", lambda *_: self.win.add_inbox_folder(self._fill_inboxes))
+        self.g_in.set_header_suffix(addf)
+        self.in_rows = []
+        self._fill_inboxes()
+        page.add(self.g_in)
+
+        g2 = Adw.PreferencesGroup(title="Nombres y arte")
+        short = Adw.SwitchRow(title="Nombres cortos para OPL viejo",
+                              subtitle="Máx. 32 caracteres, sin acentos. Desactívalo si usas OPL 1.1 o posterior.",
+                              active=int(cfg.get("max_name", 32) or 0) > 0)
+        short.connect("notify::active", lambda r, _p: self._set("max_name", 32 if r.get_active() else 0))
+        g2.add(short)
+        art = Adw.SwitchRow(title="Descargar arte al copiar",
+                            subtitle="Portada, contraportada, lomo, logo, fondo y capturas desde la base pública de OPL.",
+                            active=bool(cfg.get("download_art", True)))
+        art.connect("notify::active", lambda r, _p: self._set("download_art", r.get_active()))
+        g2.add(art)
+        page.add(g2)
+
+    def _fill_inboxes(self):
+        for r in self.in_rows:
+            self.g_in.remove(r)
+        self.in_rows = []
+        roots = self.win.cfg.get("inboxes") or []
+        if not roots:
+            r = Adw.ActionRow(title="Ninguna carpeta", subtitle="Agrega una con el botón +")
+            self.g_in.add(r)
+            self.in_rows.append(r)
+        for path in roots:
+            ok = os.path.isdir(path)
+            r = Adw.ActionRow(title=GLib.markup_escape_text(os.path.basename(path.rstrip("/")) or path),
+                              subtitle=GLib.markup_escape_text(path + ("" if ok else "  (no encontrada)")))
+            rm = Gtk.Button(icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER,
+                            tooltip_text="Quitar de la lista (no borra archivos)")
+            rm.add_css_class("flat")
+            rm.connect("clicked", lambda *_a, p=path: self._remove_inbox(p))
+            r.add_suffix(rm)
+            self.g_in.add(r)
+            self.in_rows.append(r)
+
+    def _remove_inbox(self, path):
+        self.win.cfg["inboxes"] = [p for p in self.win.cfg.get("inboxes") or [] if p != path]
+        core.save_config(self.win.cfg)
+        self._fill_inboxes()
+        self.win.inbox.reload()
+
+    def _folder_row(self, title, key, desc):
+        row = Adw.ActionRow(title=title, subtitle=self.win.cfg[key])
+        row.set_tooltip_text(desc)
+        btn = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
+        btn.add_css_class("flat")
+        row.add_suffix(btn)
+        row.set_activatable_widget(btn)
+
+        def pick(*_):
+            d = Gtk.FileDialog(title=title)
+            if os.path.isdir(self.win.cfg[key]):
+                d.set_initial_folder(Gio.File.new_for_path(self.win.cfg[key]))
+
+            def chosen(dialog, res):
+                try:
+                    f = dialog.select_folder_finish(res)
+                except GLib.Error:
+                    return
+                self._set(key, f.get_path())
+                row.set_subtitle(f.get_path())
+            d.select_folder(self.win, None, chosen)
+        btn.connect("clicked", pick)
+        return row
+
+    def _set(self, key, value):
+        self.win.cfg[key] = value
+        core.save_config(self.win.cfg)
+        self.win.reload_all()
+
+
+# =============================================================== Ventana
+class MainWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="OPL Manager", default_width=1180, default_height=780)
+        self.cfg = core.load_config()
+
+        self.toasts = Adw.ToastOverlay()
+        tv = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.vstack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher(stack=self.vstack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
+
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Volver a leer (F5)")
+        refresh.connect("clicked", lambda *_: self.reload_all())
+        header.pack_start(refresh)
+        menu = Gio.Menu()
+        menu.append("Buscar pendrive o disco OPL", "win.find-drive")
+        menu.append("Agregar carpeta de ROMs…", "win.add-folder")
+        menu.append("Ajustes", "win.settings")
+        menu.append("Abrir biblioteca en Archivos", "win.open-lib")
+        menu.append("Acerca de", "win.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        tv.add_top_bar(header)
+
+        self.library = LibraryPage(self)
+        self.inbox = InboxPage(self)
+        self.lib_page = self.vstack.add_titled_with_icon(self.library, "library", "Biblioteca", "view-grid-symbolic")
+        self.inbox_page = self.vstack.add_titled_with_icon(self.inbox, "inbox", "Bandeja de entrada",
+                                                           "folder-download-symbolic")
+        tv.set_content(self.vstack)
+        self.toasts.set_child(tv)
+        self.set_content(self.toasts)
+
+        for name, cb in (("settings", lambda *_: SettingsDialog(self).present(self)),
+                         ("open-lib", lambda *_: os.path.isdir(self.cfg["library"]) and Gio.AppInfo.launch_default_for_uri(
+                             GLib.filename_to_uri(self.cfg["library"]), None)),
+                         ("about", self._about),
+                         ("find-drive", lambda *_: DriveDialog(self).present(self)),
+                         ("add-folder", lambda *_: self.add_inbox_folder()),
+                         ("reload", lambda *_: self.reload_all())):
+            a = Gio.SimpleAction.new(name, None)
+            a.connect("activate", cb)
+            self.add_action(a)
+        app.set_accels_for_action("win.reload", ["F5", "<Control>r"])
+        app.set_accels_for_action("win.settings", ["<Control>comma"])
+        self.vstack.set_visible_child_name("library")
+        self.reload_all()
+
+        # Avisar / usar automáticamente el pendrive OPL cuando se conecta
+        self.vmon = Gio.VolumeMonitor.get()
+        self.vmon.connect("mount-added", lambda *_: GLib.timeout_add(1500, self._on_mount_added))
+        self.vmon.connect("mount-removed", lambda *_: GLib.timeout_add(800, self._on_mount_removed))
+        if not os.path.isdir(self.cfg["library"]):
+            run_bg(core.find_opl_drives, self._auto_pick)
+
+    # ---- unidades
+    def set_library(self, path):
+        self.cfg["library"] = path
+        core.save_config(self.cfg)
+        self.toast(f"Biblioteca: {path}")
+        self.reload_all()
+
+    def _auto_pick(self, drives):
+        opl = [d for d in drives if d["is_opl"]]
+        if len(opl) == 1:
+            self.set_library(opl[0]["path"])
+        elif len(opl) > 1:
+            DriveDialog(self).present(self)
+
+    def _on_mount_added(self):
+        if os.path.isdir(self.cfg["library"]):
+            def maybe_offer(drives):
+                cur = os.path.realpath(self.cfg["library"])
+                for d in drives:
+                    if d["is_opl"] and not cur.startswith(os.path.realpath(d["path"])):
+                        t = Adw.Toast(title=GLib.markup_escape_text(f"Se conectó «{d['label']}» con OPL"),
+                                      button_label="Usar", timeout=8)
+                        t.connect("button-clicked", lambda *_a, p=d["path"]: self.set_library(p))
+                        self.toasts.add_toast(t)
+            run_bg(core.find_opl_drives, maybe_offer)
+        else:
+            run_bg(core.find_opl_drives, self._auto_pick)
+        return False
+
+    def _on_mount_removed(self):
+        if not os.path.isdir(self.cfg["library"]):
+            self.toast("Se desconectó la biblioteca")
+            self.library.reload()
+        return False
+
+    def add_inbox_folder(self, after=None):
+        d = Gtk.FileDialog(title="Agregar carpeta de ROMs")
+
+        def chosen(dialog, res):
+            try:
+                f = dialog.select_folder_finish(res)
+            except GLib.Error:
+                return
+            path = f.get_path()
+            roots = self.cfg.get("inboxes") or []
+            if path in roots:
+                self.toast("Esa carpeta ya está en la lista")
+                return
+            if os.path.realpath(path).startswith(os.path.realpath(self.cfg["library"]).rstrip("/") + "/") or \
+                    os.path.realpath(path) == os.path.realpath(self.cfg["library"]):
+                self.toast("Esa carpeta es la biblioteca OPL; elige otra")
+                return
+            self.cfg["inboxes"] = roots + [path]
+            core.save_config(self.cfg)
+            self.toast(f"Agregada: {path}")
+            self.inbox.reload()
+            self.vstack.set_visible_child_name("inbox")
+            if after:
+                after()
+        d.select_folder(self, None, chosen)
+
+    def reload_all(self):
+        self.library.reload()
+        self.inbox.reload()
+
+    def update_badge(self, n):
+        self.inbox_page.set_needs_attention(n > 0)
+        self.inbox_page.set_badge_number(n)
+
+    def toast(self, msg):
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(msg), timeout=4))
+
+    def _about(self, *_):
+        Adw.AboutDialog(application_name="OPL Manager", application_icon="media-optical",
+                        developer_name="OPL Manager para Linux", version="0.1.0",
+                        comments="Gestor de bibliotecas de Open PS2 Loader para Linux.\n"
+                                 "Arte: github.com/Luden02/psx-ps2-opl-art-database").present(self)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        from gi.repository import Gdk
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.props.active_window or MainWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))
