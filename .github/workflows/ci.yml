@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Comprobar sintaxis
         run: python3 -m py_compile oplcore.py opl_manager.py
       - name: Pruebas
