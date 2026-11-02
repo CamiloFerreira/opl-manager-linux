@@ -6,9 +6,13 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 [![CI](https://github.com/CamiloFerreira/opl-manager-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/CamiloFerreira/opl-manager-linux/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/CamiloFerreira/opl-manager-linux)](https://github.com/CamiloFerreira/opl-manager-linux/releases/latest)
 
-![Biblioteca con las portadas de los juegos](docs/screenshots/library.png)
+![Demo de OPL Manager: buscar, ver un juego, descargar arte y copiar juegos](docs/demo.gif)
+
+**[▶ Ver el video completo con narración (2 min, MP4)](https://github.com/CamiloFerreira/opl-manager-linux/releases/download/v0.2.0/OPL-Manager-demo.mp4)**
 
 ## Capturas
+
+![Biblioteca con las portadas de los juegos](docs/screenshots/library.png)
 
 | Detalle de un juego | Bandeja de entrada |
 |---|---|
@@ -16,7 +20,7 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 | **Duplicados** | **Ajustes** |
 | ![Elegir qué copia conservar de un juego repetido](docs/screenshots/duplicates.png) | ![Ajustes de carpetas, nombres y arte](docs/screenshots/settings.png) |
 
-<sub>Capturas hechas con una biblioteca de demostración.</sub>
+<sub>Capturas y video hechos con una biblioteca de demostración.</sub>
 
 ## Qué hace
 
