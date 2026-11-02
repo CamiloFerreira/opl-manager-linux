@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -66,6 +66,9 @@ DEFAULT_CONFIG = {
     "max_name": 32,             # 0 = sin límite (OPL nuevo)
     "download_art": True,
     "sort": 0,                  # 0 nombre, 1 código, 2 tamaño, 3 más recientes
+    "auto_update": True,        # buscar versiones nuevas al abrir (máx. 1 vez al día)
+    "auto_install": True,       # instalarlas solas cuando no hace falta contraseña
+    "last_update_check": 0,
 }
 
 

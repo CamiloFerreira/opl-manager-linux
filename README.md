@@ -3,6 +3,21 @@
 Gestor de bibliotecas de **Open PS2 Loader (OPL)** para Linux, al estilo de OPL Manager de Windows.
 Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 
+[![CI](https://github.com/CamiloFerreira/opl-manager-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/CamiloFerreira/opl-manager-linux/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/CamiloFerreira/opl-manager-linux)](https://github.com/CamiloFerreira/opl-manager-linux/releases/latest)
+
+![Biblioteca con las portadas de los juegos](docs/screenshots/library.png)
+
+## Capturas
+
+| Detalle de un juego | Bandeja de entrada |
+|---|---|
+| ![Detalle de un juego con su arte de OPL](docs/screenshots/detail.png) | ![Bandeja de entrada con juegos nuevos para copiar](docs/screenshots/inbox.png) |
+| **Duplicados** | **Ajustes** |
+| ![Elegir qué copia conservar de un juego repetido](docs/screenshots/duplicates.png) | ![Ajustes de carpetas, nombres y arte](docs/screenshots/settings.png) |
+
+<sub>Capturas hechas con una biblioteca de demostración.</sub>
+
 ## Qué hace
 
 **Biblioteca** (el pendrive o disco de la PS2):
@@ -21,6 +36,13 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 **Unidades**:
 - Busca sola el pendrive o disco con OPL conectado, y avisa cuando conectas uno.
 - Advierte si la unidad es FAT32 (máximo 4 GB por archivo).
+
+**Actualizaciones automáticas**:
+- Al abrir, como máximo una vez al día, busca versiones nuevas en los releases de GitHub.
+- Si instalaste el ejecutable (`install.sh` o descarga directa), la versión nueva se descarga, se verifica con
+  su SHA256 y se instala sola: solo tienes que pulsar **Reiniciar**.
+- Si instalaste el `.deb`, te avisa y la instala con tu contraseña.
+- Se puede desactivar en Ajustes → Actualizaciones, o buscar a mano en el menú ☰ → *Buscar actualizaciones*.
 
 ## Seguridad
 - En la biblioteca nunca se borra ni se sobrescribe nada sin preguntar. Al cambiar una portada, la anterior queda como `.bak`.

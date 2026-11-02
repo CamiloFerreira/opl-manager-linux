@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 
 import gi
@@ -11,10 +12,11 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import oplcore as core  # noqa: E402
+import updater  # noqa: E402
 
 APP_ID = "io.github.camiloferreira.OplManager"
 COVER_W, COVER_H = 140, 200
@@ -27,6 +29,14 @@ CSS = b"""
 .game-title { font-weight: 600; }
 .art-thumb { border-radius: 4px; background: alpha(currentColor, 0.06); }
 """
+
+
+def tilde(path):
+    """Ruta para mostrar: la carpeta personal se abrevia como ~."""
+    home = os.path.expanduser("~").rstrip("/")
+    if path and (path == home or path.startswith(home + "/")):
+        return "~" + path[len(home):]
+    return path or ""
 
 
 def run_bg(fn, on_done=None, on_error=None):
@@ -165,7 +175,7 @@ class LibraryPage(Gtk.Box):
         n_ps2 = sum(g.kind != "POPS" for g in games)
         n_ps1 = sum(g.kind == "POPS" for g in games)
         no_cov = sum(1 for g in games if g.kind != "POPS" and not g.art("COV"))
-        self.status.set_text(f"{lib}  ·  {n_ps2} PS2  ·  {n_ps1} PS1  ·  {no_cov} sin portada  ·  "
+        self.status.set_text(f"{tilde(lib)}  ·  {n_ps2} PS2  ·  {n_ps1} PS1  ·  {no_cov} sin portada  ·  "
                              f"{core.human_size(core.disk_free(lib))} libres")
         self.dups = core.find_duplicates(games)
         n_extra = sum(len(gs) - 1 for gs in self.dups)
@@ -568,8 +578,8 @@ class InboxPage(Gtk.Box):
             return
         roots, lib = list(self.win.cfg.get("inboxes") or []), self.win.cfg["library"]
         self.stack.set_visible_child_name("loading")
-        self.status.set_text("  ·  ".join(roots))
-        self.status.set_tooltip_text("\n".join(roots))
+        self.status.set_text("  ·  ".join(map(tilde, roots)))
+        self.status.set_tooltip_text("\n".join(map(tilde, roots)))
         if not roots:
             self.empty.set_title("Sin carpetas de ROMs")
             self.empty.set_description("Agrega la carpeta de descargas o donde guardas tus ROMs.")
@@ -825,7 +835,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         srch = Gtk.Button(icon_name="system-search-symbolic", valign=Gtk.Align.CENTER,
                           tooltip_text="Buscar pendrive o disco OPL conectado")
         srch.add_css_class("flat")
-        srch.connect("clicked", lambda *_: DriveDialog(self.win, on_pick=lambda p: self.lib_row.set_subtitle(p)).present(self))
+        srch.connect("clicked", lambda *_: DriveDialog(self.win, on_pick=lambda p: self.lib_row.set_subtitle(tilde(p))).present(self))
         self.lib_row.add_suffix(srch)
         g1.add(self.lib_row)
         ps1 = Adw.EntryRow(title="Carpeta de la biblioteca para .bin/.cue de PS1", text=cfg.get("ps1_dir") or "CD",
@@ -858,6 +868,30 @@ class SettingsDialog(Adw.PreferencesDialog):
         g2.add(art)
         page.add(g2)
 
+        mode = updater.install_mode()
+        how = {"self": "se instalan solas, sin contraseña",
+               "deb": "paquete .deb: se instalan con tu contraseña",
+               "source": "copia del código: actualiza con git pull"}[mode]
+        g3 = Adw.PreferencesGroup(title="Actualizaciones",
+                                  description=f"Versión {core.__version__} · {how}")
+        au = Adw.SwitchRow(title="Buscar actualizaciones automáticamente",
+                           subtitle="Al abrir la app, como máximo una vez al día, en los releases de GitHub.",
+                           active=bool(cfg.get("auto_update", True)))
+        au.connect("notify::active", lambda r, _p: self._set("auto_update", r.get_active(), reload=False))
+        g3.add(au)
+        if mode == "self":
+            ai = Adw.SwitchRow(title="Instalarlas solas",
+                               subtitle="Se descargan, se verifican (SHA256) y solo tienes que reiniciar.",
+                               active=bool(cfg.get("auto_install", True)))
+            ai.connect("notify::active", lambda r, _p: self._set("auto_install", r.get_active(), reload=False))
+            au.bind_property("active", ai, "sensitive", GObject.BindingFlags.SYNC_CREATE)
+            g3.add(ai)
+        now = Adw.ButtonRow(title="Buscar ahora") if hasattr(Adw, "ButtonRow") else None
+        if now:
+            now.connect("activated", lambda *_: (self.win.check_updates(manual=True), self.close()))
+            g3.add(now)
+        page.add(g3)
+
     def _fill_inboxes(self):
         for r in self.in_rows:
             self.g_in.remove(r)
@@ -870,7 +904,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         for path in roots:
             ok = os.path.isdir(path)
             r = Adw.ActionRow(title=GLib.markup_escape_text(os.path.basename(path.rstrip("/")) or path),
-                              subtitle=GLib.markup_escape_text(path + ("" if ok else "  (no encontrada)")))
+                              subtitle=GLib.markup_escape_text(tilde(path) + ("" if ok else "  (no encontrada)")))
             rm = Gtk.Button(icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER,
                             tooltip_text="Quitar de la lista (no borra archivos)")
             rm.add_css_class("flat")
@@ -886,7 +920,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self.win.inbox.reload()
 
     def _folder_row(self, title, key, desc):
-        row = Adw.ActionRow(title=title, subtitle=self.win.cfg[key])
+        row = Adw.ActionRow(title=title, subtitle=GLib.markup_escape_text(tilde(self.win.cfg[key])))
         row.set_tooltip_text(desc)
         btn = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER)
         btn.add_css_class("flat")
@@ -904,15 +938,16 @@ class SettingsDialog(Adw.PreferencesDialog):
                 except GLib.Error:
                     return
                 self._set(key, f.get_path())
-                row.set_subtitle(f.get_path())
+                row.set_subtitle(GLib.markup_escape_text(tilde(f.get_path())))
             d.select_folder(self.win, None, chosen)
         btn.connect("clicked", pick)
         return row
 
-    def _set(self, key, value):
+    def _set(self, key, value, reload=True):
         self.win.cfg[key] = value
         core.save_config(self.win.cfg)
-        self.win.reload_all()
+        if reload:
+            self.win.reload_all()
 
 
 # =============================================================== Ventana
@@ -934,11 +969,17 @@ class MainWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("Buscar pendrive o disco OPL", "win.find-drive")
         menu.append("Agregar carpeta de ROMs…", "win.add-folder")
+        menu.append("Buscar actualizaciones", "win.check-updates")
         menu.append("Ajustes", "win.settings")
         menu.append("Abrir biblioteca en Archivos", "win.open-lib")
         menu.append("Acerca de", "win.about")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
         tv.add_top_bar(header)
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect("button-clicked", self._on_banner)
+        tv.add_top_bar(self.banner)
+        self.pending_release = None
+        self.update_state = ""          # "available" | "installed"
 
         self.library = LibraryPage(self)
         self.inbox = InboxPage(self)
@@ -955,6 +996,7 @@ class MainWindow(Adw.ApplicationWindow):
                          ("about", self._about),
                          ("find-drive", lambda *_: DriveDialog(self).present(self)),
                          ("add-folder", lambda *_: self.add_inbox_folder()),
+                         ("check-updates", lambda *_: self.check_updates(manual=True)),
                          ("reload", lambda *_: self.reload_all())):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
@@ -965,17 +1007,74 @@ class MainWindow(Adw.ApplicationWindow):
         self.reload_all()
 
         # Avisar / usar automáticamente el pendrive OPL cuando se conecta
+        # unidades ya conectadas al abrir: no se anuncian como "nuevas"
+        self.known_mounts = {d["path"] for d in core.find_opl_drives()}
         self.vmon = Gio.VolumeMonitor.get()
         self.vmon.connect("mount-added", lambda *_: GLib.timeout_add(1500, self._on_mount_added))
         self.vmon.connect("mount-removed", lambda *_: GLib.timeout_add(800, self._on_mount_removed))
         if not os.path.isdir(self.cfg["library"]):
             run_bg(core.find_opl_drives, self._auto_pick)
+        if updater.should_check(self.cfg):
+            GLib.timeout_add_seconds(3, lambda: (self.check_updates(), False)[1])
+
+    # ---- actualizaciones
+    def check_updates(self, manual=False):
+        def done(rel):
+            self.cfg["last_update_check"] = time.time()
+            core.save_config(self.cfg)
+            if not updater.is_newer(rel["version"], core.__version__):
+                if manual:
+                    self.toast(f"Tienes la última versión ({core.__version__})")
+                return
+            self.pending_release = rel
+            mode = updater.install_mode()
+            if mode == "self" and self.cfg.get("auto_install", True):
+                self._install_update()
+            else:
+                self.update_state = "available"
+                self.banner.set_title(f"Hay una nueva versión: {rel['version']} (tienes {core.__version__})")
+                self.banner.set_button_label("Actualizar" if mode != "source" else "Ver novedades")
+                self.banner.set_revealed(True)
+
+        def fail(e):
+            if manual:
+                self.toast(f"No se pudo buscar actualizaciones: {e}")
+        run_bg(updater.latest_release, done, fail)
+
+    def _install_update(self):
+        rel = self.pending_release
+        self.banner.set_title(f"Actualizando a la versión {rel['version']}…")
+        self.banner.set_button_label(None)
+        self.banner.set_revealed(True)
+
+        def done(_):
+            self.update_state = "installed"
+            self.banner.set_title(f"OPL Manager se actualizó a la versión {rel['version']}")
+            self.banner.set_button_label("Reiniciar")
+
+        def fail(e):
+            self.update_state = "available"
+            self.banner.set_title(f"No se pudo actualizar a {rel['version']}: {e}")
+            self.banner.set_button_label("Reintentar")
+        run_bg(lambda: updater.apply_update(rel), done, fail)
+
+    def _on_banner(self, *_):
+        if self.update_state == "installed":
+            if self.inbox.importing:
+                self.toast("Espera a que termine la copia antes de reiniciar")
+                return
+            updater.restart()
+        elif self.pending_release:
+            if updater.install_mode() == "source":
+                Gio.AppInfo.launch_default_for_uri(self.pending_release["url"], None)
+            else:
+                self._install_update()
 
     # ---- unidades
     def set_library(self, path):
         self.cfg["library"] = path
         core.save_config(self.cfg)
-        self.toast(f"Biblioteca: {path}")
+        self.toast(f"Biblioteca: {tilde(path)}")
         self.reload_all()
 
     def _auto_pick(self, drives):
@@ -989,7 +1088,9 @@ class MainWindow(Adw.ApplicationWindow):
         if os.path.isdir(self.cfg["library"]):
             def maybe_offer(drives):
                 cur = os.path.realpath(self.cfg["library"])
-                for d in drives:
+                new = [d for d in drives if d["path"] not in self.known_mounts]
+                self.known_mounts |= {d["path"] for d in drives}
+                for d in new:
                     if d["is_opl"] and not cur.startswith(os.path.realpath(d["path"])):
                         t = Adw.Toast(title=GLib.markup_escape_text(f"Se conectó «{d['label']}» con OPL"),
                                       button_label="Usar", timeout=8)
@@ -1001,6 +1102,7 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_mount_removed(self):
+        self.known_mounts = {d["path"] for d in core.find_opl_drives()}
         if not os.path.isdir(self.cfg["library"]):
             self.toast("Se desconectó la biblioteca")
             self.library.reload()
@@ -1025,7 +1127,7 @@ class MainWindow(Adw.ApplicationWindow):
                 return
             self.cfg["inboxes"] = roots + [path]
             core.save_config(self.cfg)
-            self.toast(f"Agregada: {path}")
+            self.toast(f"Agregada: {tilde(path)}")
             self.inbox.reload()
             self.vstack.set_visible_child_name("inbox")
             if after:
