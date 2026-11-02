@@ -27,7 +27,7 @@ Comment=Gestor de juegos de PS2 para Open PS2 Loader
 Exec=$BIN
 Icon=media-optical
 Terminal=false
-Categories=Game;Utility;
+Categories=Game;
 StartupWMClass=io.github.camiloferreira.OplManager
 DESKTOP
 update-desktop-database "$(dirname "$DESK")" 2>/dev/null || true

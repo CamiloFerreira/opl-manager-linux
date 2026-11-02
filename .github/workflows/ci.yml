@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Comprobar sintaxis
+        run: python3 -m py_compile oplcore.py opl_manager.py
+      - name: Pruebas
+        run: python3 -m unittest discover -s tests -v
+      - name: Construir paquetes
+        run: ./packaging/make-release.sh
+      - name: Probar instalación del .deb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ./dist/release/opl-manager_*_all.deb
+          test -x /usr/bin/opl-manager
+          python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw; print('GTK', Gtk.MAJOR_VERSION, Gtk.MINOR_VERSION)"

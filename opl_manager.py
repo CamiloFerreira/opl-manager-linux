@@ -1045,7 +1045,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _about(self, *_):
         Adw.AboutDialog(application_name="OPL Manager", application_icon="media-optical",
-                        developer_name="OPL Manager para Linux", version="0.1.0",
+                        developer_name="CamiloFerreira", version=core.__version__,
+                        website="https://github.com/CamiloFerreira/opl-manager-linux",
+                        issue_url="https://github.com/CamiloFerreira/opl-manager-linux/issues",
+                        license_type=Gtk.License.MIT_X11,
                         comments="Gestor de bibliotecas de Open PS2 Loader para Linux.\n"
                                  "Arte: github.com/Luden02/psx-ps2-opl-art-database").present(self)
 

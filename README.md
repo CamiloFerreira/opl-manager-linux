@@ -28,25 +28,38 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 - La bandeja no se modifica: los juegos se **copian**, no se mueven.
 - Cada copia se escribe como `.part` y solo se renombra al terminar completa.
 
-## Requisitos
-Python 3.10+, GTK 4, libadwaita 1.5+, PyGObject y Pillow. En Ubuntu/Debian:
-```bash
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-pil
-```
-En Fedora: `sudo dnf install python3-gobject gtk4 libadwaita python3-pillow`.
-
 ## Instalar
+
+Descarga la última versión desde **[Releases](https://github.com/CamiloFerreira/opl-manager-linux/releases/latest)**.
+
+**Ubuntu / Debian / Linux Mint / Pop!_OS** (instala las dependencias solo):
+```bash
+sudo apt install ./opl-manager_*_all.deb
+```
+
+**Cualquier distro** — ejecutable de un archivo. Necesita Python 3.10+, GTK 4, libadwaita 1.5+, PyGObject y Pillow:
+```bash
+# Fedora:  sudo dnf install python3-gobject gtk4 libadwaita python3-pillow
+# Arch:    sudo pacman -S python-gobject gtk4 libadwaita python-pillow
+chmod +x opl-manager && ./opl-manager
+```
+
+**Desde el código:**
 ```bash
 git clone https://github.com/CamiloFerreira/opl-manager-linux.git
 cd opl-manager-linux
-./install.sh            # crea el ejecutable en ~/.local/bin/opl-manager y lo agrega al menú
-```
-Otras opciones:
-```bash
-python3 opl_manager.py  # ejecutar sin instalar
-./build.sh              # solo crear el ejecutable de un archivo en dist/opl-manager
+./install.sh            # ejecutable en ~/.local/bin/opl-manager + entrada en el menú
 ./install.sh --quitar   # desinstalar (la configuración se conserva)
+python3 opl_manager.py  # o ejecutar sin instalar
 ```
+
+## Desarrollo
+```bash
+python3 -m unittest discover -s tests -v   # pruebas
+./packaging/make-release.sh                # construye .deb, ejecutable, .tar.gz y SHA256SUMS en dist/release/
+```
+Para publicar una versión: cambia `__version__` en `oplcore.py`, haz commit y sube un tag `vX.Y.Z`;
+GitHub Actions construye los paquetes y crea el release.
 
 ## Configuración
 Menú ☰ → Ajustes: biblioteca OPL, carpetas de ROMs, carpeta para PS1, nombres cortos (máx. 32 caracteres para OPL viejo)

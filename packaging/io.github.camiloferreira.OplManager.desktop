@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OPL Manager
+GenericName=Gestor de juegos de PS2
+Comment=Gestor de bibliotecas de Open PS2 Loader (OPL)
+Exec=opl-manager
+Icon=media-optical
+Terminal=false
+Categories=Game;
+Keywords=PS2;PlayStation;OPL;ISO;
+StartupWMClass=io.github.camiloferreira.OplManager

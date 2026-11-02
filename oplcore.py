@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+__version__ = "0.1.0"
+
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
 ID_PREFIX_RE = re.compile(r"^([A-Z]{4})[_-](\d{3})\.(\d{2})[._ -]")

@@ -1,0 +1,45 @@
+name: Release
+
+# Publica un release al subir un tag vX.Y.Z (que debe coincidir con __version__ en oplcore.py)
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar que el tag coincide con la versión
+        run: |
+          V=$(python3 -c 'import re; print(re.search(r"__version__ = \"([^\"]+)\"", open("oplcore.py").read())[1])')
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::El tag $GITHUB_REF_NAME no coincide con __version__ = $V"
+            exit 1
+          fi
+
+      - name: Pruebas
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Construir paquetes
+        run: ./packaging/make-release.sh
+
+      - name: Probar instalación del .deb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ./dist/release/opl-manager_*_all.deb
+          test -x /usr/bin/opl-manager
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/release/* \
+            --title "OPL Manager ${GITHUB_REF_NAME#v}" \
+            --notes-file dist/release-notes.md \
+            --generate-notes \
+            --verify-tag
