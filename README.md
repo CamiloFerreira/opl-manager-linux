@@ -8,7 +8,11 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 
 ![Demo de OPL Manager: buscar, ver un juego, descargar arte y copiar juegos](docs/demo.gif)
 
-**[▶ Ver el video completo con narración (2 min, MP4)](https://github.com/CamiloFerreira/opl-manager-linux/releases/download/v0.2.0/OPL-Manager-demo.mp4)**
+## Video
+
+[![Ver la demo de OPL Manager en YouTube](https://img.youtube.com/vi/BAgfz78AL18/maxresdefault.jpg)](https://www.youtube.com/watch?v=BAgfz78AL18)
+
+**[▶ Ver la demo completa en YouTube](https://www.youtube.com/watch?v=BAgfz78AL18)** (2 min, con narración)
 
 ## Capturas
 
