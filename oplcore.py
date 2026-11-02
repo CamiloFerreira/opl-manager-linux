@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     "sort": 0,                  # 0 nombre, 1 código, 2 tamaño, 3 más recientes
     "trash_after_copy": False,  # mover a la papelera lo copiado de la bandeja
     "background_on_close": True,  # al cerrar durante una copia, seguir en segundo plano
+    "close_to_tray": True,      # al cerrar, quedarse en la bandeja del sistema (si existe)
     "auto_update": True,        # buscar versiones nuevas al abrir (máx. 1 vez al día)
     "auto_install": True,       # instalarlas solas cuando no hace falta contraseña
     "last_update_check": 0,

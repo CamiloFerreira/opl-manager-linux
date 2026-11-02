@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Comprobar sintaxis
-        run: python3 -m py_compile oplcore.py opl_manager.py updater.py
+        run: python3 -m py_compile oplcore.py opl_manager.py updater.py tray.py
       - name: Pruebas
         run: python3 -m unittest discover -s tests -v
       - name: Construir paquetes

@@ -50,7 +50,11 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 
 **Ventana**:
 - Se adapta a cualquier tamaño, hasta el de un teléfono (las pestañas pasan abajo y las barras se reacomodan).
-- Si la cierras mientras copia, la copia sigue en segundo plano y te avisa con una notificación al terminar.
+- **Al cerrarla queda en la bandeja del sistema** (ícono en la barra superior): un clic la vuelve a abrir y su menú
+  tiene *Mostrar*, *Bandeja de entrada*, *Buscar actualizaciones* y *Salir*. Mientras copia, el ícono muestra el
+  progreso. Para cerrarla del todo: *Salir* (también en el menú ☰ o con Ctrl+Q). En GNOME necesita la extensión
+  AppIndicator, que Ubuntu trae activada; se puede desactivar en Ajustes → Ventana.
+- Sin bandeja del sistema: si la cierras mientras copia, la copia sigue en segundo plano y te avisa al terminar.
 
 **Unidades**:
 - Busca sola el pendrive o disco con OPL conectado, y avisa cuando conectas uno.

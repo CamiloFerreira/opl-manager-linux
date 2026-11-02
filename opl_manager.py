@@ -17,6 +17,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  #
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import oplcore as core  # noqa: E402
+import tray  # noqa: E402
 import updater  # noqa: E402
 
 APP_ID = "io.github.camiloferreira.OplManager"
@@ -1074,6 +1075,7 @@ class InboxPage(Gtk.Box):
 
     def _prog(self, n, total_items, name, done, total):
         frac = done / total if total else 1
+        self.win.tray_status(f"Copiando {n + 1}/{total_items}: {name} ({int(frac * 100)} %)")
         self.progress.set_fraction((n + frac) / total_items)
         self.progress.set_text(f"{n + 1}/{total_items}  {name}  —  {core.human_size(done)} de {core.human_size(total)}")
 
@@ -1206,6 +1208,15 @@ class SettingsDialog(Adw.PreferencesDialog):
         page.add(g2)
 
         g_bg = Adw.PreferencesGroup(title="Ventana")
+        has_tray = tray.tray_available()
+        tr = Adw.SwitchRow(title="Al cerrar, quedarse en la bandeja del sistema",
+                           subtitle=("Queda un ícono en la barra superior; ábrelo con un clic o usa Salir en su menú."
+                                     if has_tray else "Tu escritorio no tiene bandeja del sistema "
+                                     "(en GNOME: extensión AppIndicator)."),
+                           active=bool(cfg.get("close_to_tray", True)) and has_tray, sensitive=has_tray)
+        tr.connect("notify::active", lambda r, _p: (self._set("close_to_tray", r.get_active(), reload=False),
+                                                     self.win.setup_tray()))
+        g_bg.add(tr)
         bg = Adw.SwitchRow(title="Seguir copiando en segundo plano al cerrar",
                            subtitle="Si cierras la ventana durante una copia, sigue y te avisa al terminar.",
                            active=bool(cfg.get("background_on_close", True)))
@@ -1324,6 +1335,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Ajustes", "win.settings")
         menu.append("Abrir biblioteca en Archivos", "win.open-lib")
         menu.append("Acerca de", "win.about")
+        menu.append("Salir", "app.quit")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
         tv.add_top_bar(header)
         self.banner = Adw.Banner(revealed=False)
@@ -1359,9 +1371,13 @@ class MainWindow(Adw.ApplicationWindow):
         narrow.connect("unapply", lambda *_: self._set_compact(False))
         self.add_breakpoint(narrow)
 
-        # ---- cerrar durante una copia: seguir en segundo plano
+        # ---- cerrar: a la bandeja del sistema (o, sin bandeja, seguir en segundo plano si está copiando)
         self.in_background = False
+        self.quit_when_done = False
+        self.tray_hint_shown = False
+        self.tray = None
         self.connect("close-request", self._on_close_request)
+        self.setup_tray()
 
         for name, cb in (("settings", lambda *_: SettingsDialog(self).present(self)),
                          ("open-lib", lambda *_: os.path.isdir(self.cfg["library"]) and Gio.AppInfo.launch_default_for_uri(
@@ -1519,17 +1535,88 @@ class MainWindow(Adw.ApplicationWindow):
     def busy(self):
         return self.inbox.importing or not self.library.art_btn.get_sensitive()
 
+    # ---- bandeja del sistema
+    def setup_tray(self):
+        want = bool(self.cfg.get("close_to_tray", True)) and tray.tray_available()
+        if want and not self.tray:
+            try:
+                self.tray = tray.TrayIcon(APP_ID, "OPL Manager", "media-optical", self.come_back, self._tray_items())
+            except GLib.Error as e:
+                print("bandeja no disponible:", e.message)
+                self.tray = None
+        elif not want and self.tray:
+            self.tray.remove()
+            self.tray = None
+
+    def _tray_items(self, new=0):
+        return [
+            (1, "Mostrar OPL Manager", self.come_back),
+            (2, f"Bandeja de entrada ({new} nuevos)" if new else "Bandeja de entrada",
+             lambda: (self.come_back(), self.vstack.set_visible_child_name("inbox"))),
+            (3, None, None),
+            (4, "Buscar actualizaciones", lambda: self.check_updates(manual=True)),
+            (5, None, None),
+            (6, "Salir", self.quit_app),
+        ]
+
+    def tray_status(self, text=None):
+        if self.tray:
+            self.tray.set_tooltip(text or "Abrir OPL Manager")
+
+    def _hide(self):
+        self.set_visible(False)
+        if not self.in_background:
+            self.in_background = True
+            self.get_application().hold()
+
     def _on_close_request(self, *_):
+        if self.tray:
+            self._hide()
+            if self.busy():
+                self.notify("background", "OPL Manager sigue copiando",
+                            "Está en la bandeja del sistema. Te aviso cuando termine.")
+            elif not self.tray_hint_shown:
+                self.notify("background", "OPL Manager sigue en la bandeja",
+                            "Haz clic en su ícono de la barra superior para abrirlo, o elige Salir en su menú.")
+            self.tray_hint_shown = True
+            return True
         if self.busy() and self.cfg.get("background_on_close", True):
-            self.set_visible(False)
-            if not self.in_background:
-                self.in_background = True
-                self.get_application().hold()
-            n = Gio.Notification.new("OPL Manager sigue trabajando")
-            n.set_body("La copia continúa en segundo plano. Te aviso cuando termine.")
-            self.get_application().send_notification("background", n)
+            self._hide()
+            self.notify("background", "OPL Manager sigue trabajando",
+                        "La copia continúa en segundo plano. Te aviso cuando termine.")
             return True              # no cerrar todavía
         return False
+
+    def notify(self, nid, title, body):
+        n = Gio.Notification.new(title)
+        n.set_body(body)
+        self.get_application().send_notification(nid, n)
+
+    def quit_app(self):
+        if self.busy():
+            self.come_back()
+            ask = Adw.AlertDialog(heading="Hay una copia en curso",
+                                  body="Si sales ahora, el juego que se está copiando quedaría a medias.")
+            ask.add_response("cancel", "Cancelar")
+            ask.add_response("later", "Salir al terminar")
+            ask.set_response_appearance("later", Adw.ResponseAppearance.SUGGESTED)
+            ask.set_default_response("later")
+            ask.set_close_response("cancel")
+
+            def resp(_d, r):
+                if r == "later":
+                    self.quit_when_done = True
+                    self.toast("OPL Manager se cerrará al terminar la copia")
+            ask.connect("response", resp)
+            ask.present(self)
+            return
+        if self.tray:
+            self.tray.remove()
+            self.tray = None
+        if self.in_background:
+            self.in_background = False
+            self.get_application().release()
+        self.get_application().quit()
 
     def come_back(self):
         """Volver a mostrar la ventana (p. ej. al abrir la app otra vez mientras trabaja)."""
@@ -1541,13 +1628,17 @@ class MainWindow(Adw.ApplicationWindow):
         self.present()
 
     def job_finished(self, title, body):
+        self.tray_status()
+        app = self.get_application()
+        if self.quit_when_done and not self.busy():
+            self.notify("done", title, body)
+            self.quit_when_done = False
+            GLib.timeout_add(300, lambda: (self.quit_app(), False)[1])
+            return
         if self.in_background:
-            n = Gio.Notification.new(title)
-            n.set_body(body)
-            app = self.get_application()
-            app.send_notification("done", n)
+            self.notify("done", title, body)
             app.withdraw_notification("background")
-            if not self.busy():      # ya no queda nada: ahora sí se cierra
+            if not self.tray and not self.busy():   # sin bandeja: ahora sí se cierra
                 self.in_background = False
                 app.release()
                 self.destroy()
@@ -1557,6 +1648,8 @@ class MainWindow(Adw.ApplicationWindow):
     def update_badge(self, n):
         self.inbox_page.set_needs_attention(n > 0)
         self.inbox_page.set_badge_number(n)
+        if self.tray:
+            self.tray.set_items(self._tray_items(n))
 
     def toast(self, msg):
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(msg), timeout=4))
@@ -1577,6 +1670,10 @@ class App(Adw.Application):
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        q = Gio.SimpleAction.new("quit", None)
+        q.connect("activate", lambda *_: self.get_windows()[0].quit_app() if self.get_windows() else self.quit())
+        self.add_action(q)
+        self.set_accels_for_action("app.quit", ["<Control>q"])
         css = Gtk.CssProvider()
         css.load_from_data(CSS)
         from gi.repository import Gdk
