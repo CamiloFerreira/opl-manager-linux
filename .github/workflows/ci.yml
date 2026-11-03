@@ -17,13 +17,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Comprobar sintaxis
-        run: python3 -m py_compile oplcore.py opl_manager.py updater.py tray.py
+        run: python3 -m py_compile oplcore.py opl_manager.py updater.py tray.py pops.py
       - name: Pruebas
         run: python3 -m unittest discover -s tests -v
       - name: Análisis estático de seguridad (bandit)
         run: |
           python3 -m venv /tmp/sec && /tmp/sec/bin/pip install -q "bandit==1.9.2"
-          /tmp/sec/bin/bandit -ll -r oplcore.py opl_manager.py updater.py tray.py
+          /tmp/sec/bin/bandit -ll -r oplcore.py opl_manager.py updater.py tray.py pops.py
       - name: Construir paquetes (sin firmar)
         run: ./packaging/make-release.sh
       - name: Probar instalación del .deb

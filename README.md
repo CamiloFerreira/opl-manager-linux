@@ -40,8 +40,13 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 **Bandeja de entrada** (tus carpetas de ROMs: descargas, colección en el equipo…):
 - Lee el código de cada juego directamente del disco (`SYSTEM.CNF`) y distingue PS2 de PS1.
 - Marca los que ya tienes en la biblioteca y los que todavía se están extrayendo.
-- Copia los juegos de PS2 a `DVD/` con nombre OPL (`SLUS_209.46.Nombre.iso`, opcionalmente corto para OPL viejo),
-  y los `.bin`/`.cue` de PS1 a la carpeta que elijas. También lleva la portada local y descarga el arte.
+- Copia los juegos de PS2 a `DVD/` con nombre OPL (`SLUS_209.46.Nombre.iso`, opcionalmente corto para OPL viejo).
+  También lleva la portada local y descarga el arte.
+- **Juegos de PS1 → POPS**: convierte los `.bin`/`.cue` a `POPS/SCUS_949.00.Nombre.VCD` (formato de cue2pops),
+  sin archivos intermedios. Acepta dumps de un solo `.bin`, dumps Redump con una pista por archivo y cues de CDRWIN
+  con PREGAP. Para jugarlos, la unidad necesita `POPSTARTER.ELF` y `POPS/POPS_IOX.PAK` (no se incluyen).
+  En Ajustes se puede elegir copiar los `.bin`/`.cue` tal cual.
+- **Arte de PS1**: portada, contraportada, lomo, logo, fondo y capturas también para los juegos de POPS.
 - **Limpiar** (botón 🗑): mueve a la papelera los juegos que ya copiaste o los que selecciones. Si el juego está en su
   propia carpeta, se va la carpeta entera (con sus `.url`, `.txt`, portadas…). También puede hacerlo solo después de
   cada copia, siempre comprobando antes que la copia quedó completa.
@@ -114,16 +119,16 @@ procedencia y crea el release. Si la versión corrige vulnerabilidades, sube `mi
 `packaging/security.json` a esa versión: todas las anteriores quedarán obligadas a actualizar.
 
 ## Configuración
-Menú ☰ → Ajustes: biblioteca OPL, carpetas de ROMs, carpeta para PS1, nombres cortos (máx. 32 caracteres para OPL viejo)
+Menú ☰ → Ajustes: biblioteca OPL, carpetas de ROMs, juegos de PS1 (convertir a VCD o copiar tal cual), nombres cortos (máx. 32 caracteres para OPL viejo)
 y descarga automática de arte. Se guarda en `~/.config/opl-manager/config.json`.
 
 ## Créditos
 - Arte de los juegos: [psx-ps2-opl-art-database](https://github.com/Luden02/psx-ps2-opl-art-database).
+- Formato `.VCD` de POPS: basado en [cue2pops](https://github.com/ErikAndren/cue2pops-mac) de krHACKen.
 - [Open PS2 Loader](https://github.com/ps2homebrew/Open-PS2-Loader).
 
 ## Pendiente
-- Convertir PS1 (`.bin`/`.cue`) a `.VCD` para POPS.
-- Arte para juegos de PS1.
+- Juegos de PS1 de varios discos: cada disco se convierte como un juego aparte (falta generar el `DISCS.TXT` de POPS).
 
 ## Licencia
 MIT. Ver [LICENSE](LICENSE).

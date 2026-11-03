@@ -18,7 +18,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.4.1"
+import pops
+
+__version__ = "0.5.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -32,7 +34,8 @@ DATA_EXT = {"iso", "bin", "img", "mdf", "nrg", "chd", "cso", "zso", "pbp", "ecm"
 COVER_RE = re.compile(r"(cover|portada|car[aá]tula)", re.I)
 IMG_EXT = {"png", "jpg", "jpeg", "webp"}
 
-ART_BASE = "https://raw.githubusercontent.com/Luden02/psx-ps2-opl-art-database/main/PS2/{id}/{id}_{t}.png"
+# {console} = PS2 o PS1 (la base tiene una carpeta para cada consola)
+ART_BASE = "https://raw.githubusercontent.com/Luden02/psx-ps2-opl-art-database/main/{console}/{id}/{id}_{t}.png"
 # tipo en OPL -> nombres en la base de arte (se usa el primero que exista)
 ART_TYPES = {
     "COV": ["COV"], "COV2": ["COV2"], "LAB": ["LAB"], "LGO": ["LGO"], "ICO": ["ICO"],
@@ -64,7 +67,8 @@ def _downloads_dir():
 DEFAULT_CONFIG = {
     "inboxes": [_downloads_dir()],   # carpetas de ROMs a revisar (bandeja de entrada)
     "library": "",              # vacío: al abrir se busca sola la unidad con OPL
-    "ps1_dir": "CD",            # carpeta de la biblioteca donde van los .bin/.cue de PS1
+    "ps1_mode": "vcd",          # PS1: "vcd" = convertir a POPS/*.VCD · "copy" = copiar los .bin/.cue a ps1_dir
+    "ps1_dir": "CD",            # carpeta de la biblioteca donde van los .bin/.cue de PS1 (modo "copy")
     "max_name": 32,             # 0 = sin límite (OPL nuevo)
     "download_art": True,
     "sort": 0,                  # 0 nombre, 1 código, 2 tamaño, 3 más recientes
@@ -137,14 +141,16 @@ def _save_cache():
 
 def _read_boot_line(path):
     """Línea BOOT/BOOT2 del SYSTEM.CNF, buscando el archivo en el índice ISO9660
-    (2048 o 2352 bytes por sector). Si falla, busca el texto en los primeros 8 MB."""
+    (2048 o 2352 bytes por sector). Si falla, busca el texto en los primeros 8 MB.
+    En un .VCD de POPS el disco empieza después de la cabecera de 1 MiB."""
+    base = pops.HEADER if ext_of(path) == "vcd" else 0
     try:
         f = open(path, "rb")
     except OSError:
         return ""
     with f:
         def sec(lba, size, off):
-            f.seek(lba * size + off)
+            f.seek(base + lba * size + off)
             return f.read(2048)
         try:
             for size, off in ((2048, 0), (2352, 24), (2352, 16)):
@@ -172,7 +178,7 @@ def _read_boot_line(path):
                             return m.group(0)
                     i += n
                 break
-            f.seek(0)
+            f.seek(base)
             m = re.search(rb"BOOT2? *= *cdrom0?:[^\r\n;]{0,40}", f.read(8_000_000))
             return m.group(0).decode("latin-1") if m else ""
         except (OSError, ValueError, IndexError, OverflowError):
@@ -246,7 +252,7 @@ def short_title(title, max_len=32):
 def opl_filename(gid, title, ext, max_len=32):
     """Nombre de archivo (nunca una ruta: sin '/', sin '..', sin empezar con '.')."""
     t = short_title(title, max_len).lstrip(". ") or "Juego"
-    ext = re.sub(r"[^a-z0-9]", "", (ext or "").lower())[:8] or "iso"
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext or "")[:8] or "iso"
     gid = gid if valid_gid(gid) else ""
     name = f"{gid}.{t}.{ext}" if gid else f"{t}.{ext}"
     if os.sep in name or name in (".", "..") or "\x00" in name:
@@ -294,6 +300,11 @@ class Game:
         p = os.path.join(self.library, "ART", f"{self.gid}_{t}.png")
         return p if os.path.exists(p) else ""
 
+    @property
+    def console(self):
+        """Consola para la base de arte: los juegos de POPS son de PS1."""
+        return "PS1" if self.kind == "POPS" else "PS2"
+
     def missing_art(self):
         return [t for t in ART_TYPES if not self.art(t)] if self.gid else []
 
@@ -310,7 +321,7 @@ def scan_library(root):
                 continue
             stem = os.path.splitext(name)[0]
             gid = id_from_name(name)
-            if not gid and kind != "POPS":
+            if not gid:
                 gid = disc_info(p)[1]
             try:
                 st = os.stat(p)
@@ -354,7 +365,7 @@ def find_duplicates(games):
 
 def rename_game(game, new_title, max_len=32):
     """Renombra el archivo del juego (no borra nada). Devuelve la nueva ruta."""
-    ext = ext_of(game.path)
+    ext = os.path.splitext(game.path)[1][1:]          # se conserva tal cual (p. ej. .VCD en mayúsculas)
     new = os.path.join(os.path.dirname(game.path), opl_filename(game.gid, new_title, ext, max_len))
     if new == game.path:
         return new
@@ -403,9 +414,9 @@ def _fetch_png(url):
         return None
 
 
-def download_art(library, gid, types=None):
+def download_art(library, gid, types=None, console="PS2"):
     """Descarga el arte que falta. Nunca sobrescribe. Devuelve la lista de tipos descargados."""
-    if not valid_gid(gid):
+    if not valid_gid(gid) or console not in ("PS2", "PS1"):
         return []
     art = os.path.join(library, "ART")
     os.makedirs(art, exist_ok=True)
@@ -417,7 +428,7 @@ def download_art(library, gid, types=None):
         if os.path.exists(dest):
             continue
         for remote in ART_TYPES[t]:
-            data = _fetch_png(ART_BASE.format(id=gid, t=remote))
+            data = _fetch_png(ART_BASE.format(console=console, id=gid, t=remote))
             if data:
                 tmp = dest + ".part"
                 with open(tmp, "wb") as f:
@@ -676,13 +687,19 @@ def scan_inbox(root, library="", ps1_dir="CD"):
             add_group(d, roms, hint, _recent(d))
 
     for it in items:
-        if it.gid and it.gid in lib_ids and not it.multi:
+        if it.gid and it.gid in lib_ids:
             it.in_library = lib_ids[it.gid]
         elif it.multi and library:
             hit = [os.path.basename(f) for f in it.files
                    if os.path.exists(os.path.join(library, ps1_dir or "CD", os.path.basename(f)))]
             if hit:
                 it.in_library = hit[0]
+        if it.console == "PS1":
+            it.extra["vcd_ok"] = pops.can_convert(it.files)
+            if it.extra["vcd_ok"] and it.multi:
+                # el VCD es un solo archivo: el título se puede editar como en los de PS2
+                cue = next((f for f in it.files if ext_of(f) == "cue"), it.main)
+                it.title = strip_id(os.path.splitext(os.path.basename(cue))[0])
         # arte que ya está en la bandeja (p. ej. bajado con opl-art.py)
         if it.gid:
             it.extra["inbox_art"] = {t: p for t in ART_TYPES
@@ -775,25 +792,34 @@ def _is_plain_png(path):
 
 
 def import_item(item, cfg, progress=None):
-    """Copia un juego de la bandeja a la biblioteca (sin borrar nada en ningún lado).
-    Devuelve (lista de rutas copiadas, lista de arte agregado)."""
+    """Copia un juego de la bandeja a la biblioteca (sin borrar nada en ningún lado). Los de PS1 se
+    convierten a .VCD para POPS si así está configurado. Devuelve (lista de rutas copiadas, lista de arte agregado)."""
     lib = cfg["library"]
-    max_len = int(cfg.get("max_name", 32) or 0)
     if item.in_library:
         raise FileExistsError(f"Ya está en la biblioteca como {item.in_library}")
-    if item.console == "PS2" and not item.multi:
-        dest_dir = os.path.join(lib, "DVD")
-    else:
-        dest_dir = os.path.join(lib, cfg.get("ps1_dir") or "CD")
+    action, folder, name = item_destination(item, cfg)
+    dest_dir = os.path.join(lib, folder)
     os.makedirs(dest_dir, exist_ok=True)
 
+    if action == "vcd":
+        target = free_path(os.path.join(dest_dir, name))
+        need = pops.vcd_size(pops.plan_for(item.files))
+        if disk_free(lib) < need + 50 * 1024 * 1024:
+            raise OSError(f"No hay espacio: hacen falta {human_size(need)} y quedan {human_size(disk_free(lib))}")
+        pops.convert(item.files, target, progress)
+        copied = [target]
+    else:
+        copied = _copy_item(item, dest_dir, name, lib, progress)
+    return copied, _import_art(item, cfg, lib)
+
+
+def _copy_item(item, dest_dir, name, lib, progress):
     if item.multi:
         targets = [os.path.join(dest_dir, os.path.basename(f)) for f in item.files]
         clash = [t for t in targets if os.path.exists(t)]
         if clash:
             raise FileExistsError(f"Ya existe en la biblioteca: {os.path.basename(clash[0])}")
     else:
-        name = opl_filename(item.gid, item.title, ext_of(item.main), max_len)
         targets = [free_path(os.path.join(dest_dir, name))]
 
     total = sum(os.path.getsize(f) for f in item.files)
@@ -808,7 +834,11 @@ def import_item(item, cfg, progress=None):
     for src, dst in zip(item.files, targets):
         done += _copy_file(src, dst, progress, done, total)
         copied.append(dst)
+    return copied
 
+
+def _import_art(item, cfg, lib):
+    """Arte del juego recién copiado: el de la bandeja, la portada local y el de la base (PS2 o PS1)."""
     art = []
     if item.gid:
         art_dir = os.path.join(lib, "ART")
@@ -825,5 +855,34 @@ def import_item(item, cfg, progress=None):
             except Exception:
                 pass
         if cfg.get("download_art", True):
-            art += download_art(lib, item.gid)
-    return copied, art
+            art += download_art(lib, item.gid, console="PS1" if item.console == "PS1" else "PS2")
+    return art
+
+
+def ps1_dir(cfg):
+    """Carpeta de la biblioteca para los .bin/.cue copiados tal cual (siempre dentro de la biblioteca)."""
+    d = re.sub(r"[^A-Za-z0-9 _.-]", "", str(cfg.get("ps1_dir") or "CD")).strip(" .") or "CD"
+    return d
+
+
+def item_destination(item, cfg):
+    """Qué se hará con un juego de la bandeja: (acción, carpeta, nombre).
+    acción: 'copy' (copiar tal cual) o 'vcd' (convertir a VCD para POPS). nombre: '' si se copian
+    varios archivos con su nombre original."""
+    max_len = int(cfg.get("max_name", 32) or 0)
+    if item.console == "PS2" and not item.multi:
+        return "copy", "DVD", opl_filename(item.gid, item.title, ext_of(item.main), max_len)
+    if item.console == "PS1" and cfg.get("ps1_mode", "vcd") == "vcd" and item.extra.get("vcd_ok"):
+        return "vcd", "POPS", opl_filename(item.gid, item.title, "VCD", max_len)
+    if item.multi:
+        return "copy", ps1_dir(cfg), ""
+    return "copy", ps1_dir(cfg), opl_filename(item.gid, item.title, ext_of(item.main), max_len)
+
+
+def pops_ready(library):
+    """POPStarter necesita POPS/POPS_IOX.PAK en la unidad para arrancar los .VCD."""
+    d = os.path.join(library, "POPS")
+    try:
+        return any(n.upper() == "POPS_IOX.PAK" for n in os.listdir(d))
+    except OSError:
+        return False

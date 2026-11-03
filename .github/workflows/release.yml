@@ -36,7 +36,7 @@ jobs:
       - name: Análisis estático de seguridad (bandit)
         run: |
           python3 -m venv /tmp/sec && /tmp/sec/bin/pip install -q "bandit==1.9.2"
-          /tmp/sec/bin/bandit -ll -r oplcore.py opl_manager.py updater.py tray.py
+          /tmp/sec/bin/bandit -ll -r oplcore.py opl_manager.py updater.py tray.py pops.py
 
       - name: Construir y firmar paquetes
         env:

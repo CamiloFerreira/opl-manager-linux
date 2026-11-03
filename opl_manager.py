@@ -213,7 +213,8 @@ def rename_dialog(win, game, on_done=None):
     hint.add_css_class("dim-label")
 
     def upd(*_):
-        hint.set_text("Quedará como: " + core.opl_filename(game.gid, entry.get_text(), core.ext_of(game.path), ml))
+        hint.set_text("Quedará como: " + core.opl_filename(game.gid, entry.get_text(),
+                                                           os.path.splitext(game.path)[1][1:], ml))
     entry.connect("changed", upd)
     upd()
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -291,7 +292,7 @@ def download_game_art(win, game, on_done=None):
         win.library.reload()
         if on_done:
             on_done()
-    run_bg(lambda: core.download_art(lib, game.gid), done, lambda e: win.toast(f"Error: {e}"))
+    run_bg(lambda: core.download_art(lib, game.gid, console=game.console), done, lambda e: win.toast(f"Error: {e}"))
 
 
 def trash_game_dialog(win, game):
@@ -396,7 +397,7 @@ class LibraryPage(Gtk.Box):
         lib = self.win.cfg["library"]
         n_ps2 = sum(g.kind != "POPS" for g in games)
         n_ps1 = sum(g.kind == "POPS" for g in games)
-        no_cov = sum(1 for g in games if g.kind != "POPS" and not g.art("COV"))
+        no_cov = sum(1 for g in games if g.gid and not g.art("COV"))
         self.status.set_text(f"{tilde(lib)}  ·  {n_ps2} PS2  ·  {n_ps1} PS1  ·  {no_cov} sin portada  ·  "
                              f"{core.human_size(core.disk_free(lib))} libres")
         self.dups = core.find_duplicates(games)
@@ -430,7 +431,7 @@ class LibraryPage(Gtk.Box):
         btn.insert_action_group("card", action_group({
             "open": (lambda: GameDialog(win, g).present(win), True),
             "rename": (lambda: rename_dialog(win, g), True),
-            "art": (lambda: download_game_art(win, g), bool(g.gid) and g.kind != "POPS"),
+            "art": (lambda: download_game_art(win, g), bool(g.gid)),
             "cover": (lambda: choose_cover(win, g), bool(g.gid)),
             "folder": (lambda: open_folder(g.path), True),
             "copy-name": (lambda: (win.get_clipboard().set(g.filename), win.toast("Nombre copiado")), True),
@@ -470,7 +471,7 @@ class LibraryPage(Gtk.Box):
             return False
         if k == 2 and g.kind != "POPS":
             return False
-        if k == 3 and (g.kind == "POPS" or g.art("COV")):
+        if k == 3 and g.art("COV"):
             return False
         if self.filter_text:
             return self.filter_text in f"{g.title} {g.gid} {g.filename}".lower()
@@ -478,7 +479,7 @@ class LibraryPage(Gtk.Box):
 
     # ---- arte de toda la biblioteca
     def _download_all_art(self, *_):
-        todo = [g for g in self.games if g.gid and g.kind != "POPS" and g.missing_art()]
+        todo = [g for g in self.games if g.gid and g.missing_art()]
         if not todo:
             self.win.toast("Todos los juegos ya tienen su arte")
             return
@@ -494,7 +495,7 @@ class LibraryPage(Gtk.Box):
                 if g.gid in seen:
                     continue
                 seen.add(g.gid)
-                total += len(core.download_art(lib, g.gid, g.missing_art()))
+                total += len(core.download_art(lib, g.gid, g.missing_art(), console=g.console))
             return total
 
         def done(total):
@@ -722,7 +723,7 @@ class GameDialog(Adw.Dialog):
             self.win.toast(f"{len(got)} imágenes nuevas" if got else "No había arte nuevo en la base")
             self.close()
             self.win.library.reload()
-        run_bg(lambda: core.download_art(lib, self.g.gid), done,
+        run_bg(lambda: core.download_art(lib, self.g.gid, console=self.g.console), done,
                lambda e: (btn.set_sensitive(True), btn.set_label("Descargar arte"), self.win.toast(f"Error: {e}")))
 
     def _change_cover(self, *_):
@@ -850,8 +851,9 @@ class InboxPage(Gtk.Box):
 
         note = Gtk.Label(wrap=True, xalign=0, margin_start=14, margin_end=14, margin_bottom=8,
                          label="Se copian, no se mueven, y en la biblioteca nunca se sobrescribe nada. Los PS2 van a DVD/ "
-                               "con nombre OPL; los .bin/.cue a la carpeta de PS1 de Ajustes. Con 🗑 puedes llevar a la "
-                               "papelera lo que ya copiaste. Clic derecho en un juego para más opciones.")
+                               "con nombre OPL; los de PS1 se convierten a .VCD en POPS/ (o se copian tal cual, según "
+                               "Ajustes). Con 🗑 puedes llevar a la papelera lo que ya copiaste. Clic derecho en un juego "
+                               "para más opciones.")
         note.add_css_class("caption")
         note.add_css_class("dim-label")
         self.append(note)
@@ -894,15 +896,20 @@ class InboxPage(Gtk.Box):
         self.win.update_badge(new)
 
     def _final_name(self, it):
-        if it.multi:
-            return ", ".join(os.path.basename(f) for f in it.files[:2]) + (" …" if len(it.files) > 2 else "")
-        return core.opl_filename(it.gid, it.title, core.ext_of(it.main), int(self.win.cfg.get("max_name", 32) or 0))
+        _action, _folder, name = core.item_destination(it, self.win.cfg)
+        if name:
+            return name
+        return ", ".join(os.path.basename(f) for f in it.files[:2]) + (" …" if len(it.files) > 2 else "")
+
+    def _renamable(self, it):
+        return bool(core.item_destination(it, self.win.cfg)[2])
 
     def _row(self, it):
         row = Adw.ActionRow(title=GLib.markup_escape_text(self._final_name(it)), title_lines=2)
-        dest = "DVD" if (it.console == "PS2" and not it.multi) else (self.win.cfg.get("ps1_dir") or "CD")
+        action, dest, _name = core.item_destination(it, self.win.cfg)
         bits = [it.console + (" (adivinado)" if it.guessed else ""), it.gid or "sin código",
-                core.human_size(it.size), f"→ {dest}/", f"desde {it.origin}"]
+                core.human_size(it.size), f"→ {dest}/" + (" (se convierte a VCD)" if action == "vcd" else ""),
+                f"desde {it.origin}"]
         if it.busy:
             bits.insert(0, "⏳ extrayéndose")
         if it.in_library:
@@ -921,7 +928,7 @@ class InboxPage(Gtk.Box):
         thumb = it.cover or it.extra.get("inbox_art", {}).get("COV", "")
         row.add_prefix(cover_widget(thumb, 42, 60))
 
-        if not it.multi:
+        if self._renamable(it):
             ed = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Cambiar nombre")
             ed.add_css_class("flat")
             ed.connect("clicked", lambda *_: self._edit_title(it, row))
@@ -929,7 +936,7 @@ class InboxPage(Gtk.Box):
 
         row.insert_action_group("row", action_group({
             "copy": (lambda: self._import([it]), not it.busy and not it.in_library and not self.importing),
-            "rename": (lambda: self._edit_title(it, row), not it.multi),
+            "rename": (lambda: self._edit_title(it, row), self._renamable(it)),
             "folder": (lambda: open_folder(it.main), True),
             "trash": (lambda: self._confirm_clean([it], f"¿Mover «{it.title}» a la papelera?"), not it.busy),
         }))
@@ -954,8 +961,11 @@ class InboxPage(Gtk.Box):
         hint.add_css_class("dim-label")
         ml = int(self.win.cfg.get("max_name", 32) or 0)
 
+        ext = core.ext_of(core.item_destination(it, self.win.cfg)[2]) or core.ext_of(it.main)
+        ext = "VCD" if ext == "vcd" else ext
+
         def upd(*_):
-            hint.set_text("Quedará como: " + core.opl_filename(it.gid, entry.get_text(), core.ext_of(it.main), ml))
+            hint.set_text("Quedará como: " + core.opl_filename(it.gid, entry.get_text(), ext, ml))
         entry.connect("changed", upd)
         upd()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1059,6 +1069,9 @@ class InboxPage(Gtk.Box):
             self.importing = False
             self.progress.set_visible(False)
             msg = f"{ok} juego(s) copiados, {art} imágenes de arte"
+            vcds = [i for i in copied_items if core.item_destination(i, cfg)[0] == "vcd"]
+            if vcds and not core.pops_ready(cfg["library"]):
+                msg += " · falta POPS/POPS_IOX.PAK para jugar los de PS1"
             self.win.job_finished("Copia terminada", msg + (f" · {len(errors)} con error" if errors else ""))
             if copied_items and self.win.cfg.get("trash_after_copy"):
                 trash_paths(self.win, core.cleanup_targets(copied_items), self.reload)
@@ -1176,9 +1189,21 @@ class SettingsDialog(Adw.PreferencesDialog):
         srch.connect("clicked", lambda *_: DriveDialog(self.win, on_pick=lambda p: self.lib_row.set_subtitle(tilde(p))).present(self))
         self.lib_row.add_suffix(srch)
         g1.add(self.lib_row)
-        ps1 = Adw.EntryRow(title="Carpeta de la biblioteca para .bin/.cue de PS1", text=cfg.get("ps1_dir") or "CD",
+        modes = ["vcd", "copy"]
+        mode_row = Adw.ComboRow(title="Juegos de PS1",
+                                subtitle="POPS necesita POPSTARTER.ELF y POPS/POPS_IOX.PAK en la unidad.",
+                                model=Gtk.StringList.new(["Convertir a .VCD para POPS (recomendado)",
+                                                          "Copiar los .bin/.cue tal cual"]))
+        cur = cfg.get("ps1_mode", "vcd")
+        mode_row.set_selected(modes.index(cur) if cur in modes else 0)
+        g1.add(mode_row)
+        ps1 = Adw.EntryRow(title="Carpeta de la biblioteca para .bin/.cue de PS1", text=core.ps1_dir(cfg),
                            show_apply_button=True)
-        ps1.connect("apply", lambda r: self._set("ps1_dir", r.get_text().strip().strip("/") or "CD"))
+        ps1.connect("apply", lambda r: (self._set("ps1_dir", core.ps1_dir({"ps1_dir": r.get_text()})),
+                                        r.set_text(core.ps1_dir(self.win.cfg))))
+        ps1.set_visible(cur == "copy")
+        mode_row.connect("notify::selected", lambda r, _p: (self._set("ps1_mode", modes[r.get_selected()]),
+                                                            ps1.set_visible(modes[r.get_selected()] == "copy")))
         g1.add(ps1)
         page.add(g1)
 
