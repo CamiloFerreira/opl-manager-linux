@@ -207,7 +207,7 @@ def trash_paths(win, paths, on_done=None):
 def rename_dialog(win, game, on_done=None):
     ml = int(win.cfg.get("max_name", 32) or 0)
     dlg = Adw.AlertDialog(heading="Cambiar nombre")
-    entry = Gtk.Entry(text=game.title, activates_default=True)
+    entry = Gtk.Entry(text=core.clean_title(game.title), activates_default=True)
     hint = Gtk.Label(xalign=0, wrap=True)
     hint.add_css_class("caption")
     hint.add_css_class("dim-label")
@@ -300,8 +300,12 @@ def trash_game_dialog(win, game):
     chk = None
     if arts:
         chk = Gtk.CheckButton(label=f"También mover su arte ({len(arts)} imágenes de ART/)")
-    confirm_trash(win, f"¿Mover «{game.title}» a la papelera?", [game.path],
-                  lambda: trash_paths(win, [game.path] + (arts if chk and chk.get_active() else []),
+    paths = [game.path]
+    if game.kind == "POPS" and core.has_pops_app(game.library, game.path):
+        paths.append(core.pops_app_dir(game.library, game.path))     # su acceso en APPS/ ya no serviría
+        paths += core.pops_app_art_files(game.library, game.path)
+    confirm_trash(win, f"¿Mover «{game.title}» a la papelera?", paths,
+                  lambda: trash_paths(win, paths + (arts if chk and chk.get_active() else []),
                                       win.library.reload),
                   extra_child=chk)
 
@@ -324,7 +328,7 @@ class LibraryPage(Gtk.Box):
         self.controls = controls
         bar.append(controls)
         bar = controls          # los controles se agregan a la fila que se acomoda sola
-        self.kind = Gtk.DropDown.new_from_strings(["Todos", "PS2 (DVD/CD)", "PS1 (POPS)", "Sin portada"])
+        self.kind = Gtk.DropDown.new_from_strings(["Todos", "PS2 (DVD/CD)", "PS1 (POPS)", "Sin portada", "Nombre sin formato"])
         self.kind.connect("notify::selected", lambda *_: self.flow.invalidate_filter())
         bar.append(self.kind)
         self.sort = Gtk.DropDown.new_from_strings(core.SORT_NAMES)
@@ -337,6 +341,19 @@ class LibraryPage(Gtk.Box):
         self.dup_btn.connect("clicked", lambda *_: DuplicatesDialog(self.win, self.dups).present(self.win))
         bar.append(self.dup_btn)
         self.dups = []
+        self.fix_btn = Gtk.Button(visible=False, tooltip_text="Juegos cuyo archivo no tiene el formato de OPL "
+                                                              "(CÓDIGO.Nombre.iso)")
+        self.fix_btn.add_css_class("suggested-action")
+        self.fix_btn.connect("clicked", lambda *_: NameFixDialog(self.win, self.fixes).present(self.win))
+        bar.append(self.fix_btn)
+        self.fixes = []
+        self.fix_paths = set()
+        self.apps_btn = Gtk.Button(visible=False, tooltip_text="Crea APPS/<juego>/XX.<juego>.ELF y title.cfg para que "
+                                                               "los juegos de PS1 aparezcan en Aplicaciones de OPL")
+        self.apps_btn.add_css_class("suggested-action")
+        self.apps_btn.connect("clicked", self._make_pops_apps)
+        bar.append(self.apps_btn)
+        self.no_app = []
         self.art_btn = Gtk.Button(label="Descargar arte faltante", tooltip_text="Baja portadas, lomos, fondos y capturas que falten. No sobrescribe nada.")
         self.art_btn.connect("clicked", self._download_all_art)
         bar.append(self.art_btn)
@@ -385,7 +402,15 @@ class LibraryPage(Gtk.Box):
             self.stack.set_visible_child_name("empty")
             self.status.set_text("")
             return
-        run_bg(lambda: core.scan_library(lib), self._loaded,
+        def scan():
+            try:
+                core.learn_pops_files(lib)      # guarda POPSTARTER.ELF / POPS_IOX.PAK para otras unidades
+            except OSError:
+                pass
+            games = core.scan_library(lib)
+            core.sync_pops_app_art(games)       # arte nuevo de un juego de PS1 -> también para su app
+            return games
+        run_bg(scan, self._loaded,
                lambda e: self.win.toast(f"Error al leer la biblioteca: {e}"))
 
     def _loaded(self, games):
@@ -404,6 +429,13 @@ class LibraryPage(Gtk.Box):
         n_extra = sum(len(gs) - 1 for gs in self.dups)
         self.dup_btn.set_label(f"Duplicados ({n_extra})")
         self.dup_btn.set_visible(bool(self.dups))
+        self.fixes = core.name_fixes(games, int(self.win.cfg.get("max_name", 32) or 0))
+        self.fix_paths = {f.game.path for f in self.fixes}
+        self.fix_btn.set_label(f"Corregir nombres ({len(self.fixes)})")
+        self.fix_btn.set_visible(bool(self.fixes))
+        self.no_app = core.missing_pops_apps(games)
+        self.apps_btn.set_label(f"Mostrar PS1 en OPL ({len(self.no_app)})")
+        self.apps_btn.set_visible(bool(self.no_app))
         self.empty.set_title("Sin juegos")
         self.empty.set_description("No hay juegos en DVD/, CD/ ni POPS/. Cópialos desde la Bandeja de entrada.")
         self.stack.set_visible_child_name("grid" if games else "empty")
@@ -473,9 +505,47 @@ class LibraryPage(Gtk.Box):
             return False
         if k == 3 and g.art("COV"):
             return False
+        if k == 4 and g.path not in self.fix_paths:
+            return False
         if self.filter_text:
             return self.filter_text in f"{g.title} {g.gid} {g.filename}".lower()
         return True
+
+    # ---- accesos de PS1 en APPS/
+    def _make_pops_apps(self, *_):
+        todo = list(self.no_app)
+        lib = self.win.cfg["library"]
+        self.apps_btn.set_sensitive(False)
+
+        def work():
+            core.ensure_pops_files(lib)
+            done, errors = 0, []
+            for g in todo:
+                try:
+                    if core.make_pops_app(lib, g.path):
+                        done += 1
+                    core.link_pops_app_art(g)
+                except (OSError, ValueError) as e:
+                    errors.append(f"{g.filename}: {e}")
+            return done, errors, core.ensure_pops_files(lib)[1]
+
+        def finished(res):
+            done, errors, missing = res
+            self.apps_btn.set_sensitive(True)
+            msg = f"{done} juego(s) de PS1 agregados a Aplicaciones de OPL"
+            if missing:
+                msg += f" · falta {', '.join(missing)} (agrégalo en Ajustes)"
+            if errors:
+                al = Adw.AlertDialog(heading="Algunos juegos no se pudieron agregar", body="\n".join(errors[:20]))
+                al.add_response("ok", "Aceptar")
+                al.present(self.win)
+            self.win.toast(msg)
+            self.reload()
+
+        def failed(e):
+            self.apps_btn.set_sensitive(True)
+            self.win.toast(f"Error: {e}")
+        run_bg(work, finished, failed)
 
     # ---- arte de toda la biblioteca
     def _download_all_art(self, *_):
@@ -616,6 +686,107 @@ class DuplicatesDialog(Adw.Dialog):
         run_bg(work, finished)
 
 
+# =============================================================== Nombres sin formato
+class NameFixDialog(Adw.Dialog):
+    """Renombra de una vez los juegos del pendrive que no tienen el formato de OPL."""
+
+    def __init__(self, win, fixes):
+        super().__init__(title="Corregir nombres", content_width=760, content_height=640)
+        self.win = win
+        self.rows = []      # [(NameFix, CheckButton)]
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage(description=(
+            "Estos juegos no tienen el nombre que usa OPL (CÓDIGO.Nombre.iso). Se renombran sin "
+            "copiar ni borrar nada; el arte y la configuración no se pierden porque van por el código. "
+            "En PS1 también se renombra la carpeta de partidas guardadas del juego."))
+        ok_grp = Adw.PreferencesGroup(title="Se pueden corregir")
+        no_id = Adw.PreferencesGroup(title="Sin código",
+                                     description="No se pudo leer el código del disco: solo se acomoda el nombre. "
+                                                 "Revísalos con «Ver detalles» antes de renombrar.")
+        bad = Adw.PreferencesGroup(title="No se pueden corregir",
+                                   description="Renómbralos a mano desde «Cambiar nombre…».")
+        used = set()
+        for f in fixes:
+            g = f.game
+            row = Adw.ActionRow(title=GLib.markup_escape_text(f.new_name),
+                                subtitle=GLib.markup_escape_text(f"{g.kind}/  ·  antes: {g.filename}"
+                                                                 + (f"  ·  {f.problem}" if f.problem else "")))
+            edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text="Cambiar nombre a mano…")
+            edit.add_css_class("flat")
+            edit.connect("clicked", lambda _b, g=g: rename_dialog(self.win, g, self.close))
+            row.add_suffix(edit)
+            if f.problem:
+                bad.add(row)
+                used.add(bad)
+                continue
+            chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=bool(g.gid))
+            chk.connect("toggled", lambda *_: self._update())
+            row.add_prefix(chk)
+            row.set_activatable_widget(chk)
+            self.rows.append((f, chk))
+            grp = ok_grp if g.gid else no_id
+            grp.add(row)
+            used.add(grp)
+        for grp in (ok_grp, no_id, bad):
+            if grp in used:
+                page.add(grp)
+        tv.set_content(page)
+
+        bottom = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        self.all_btn = Gtk.Button(label="Marcar todos")
+        self.all_btn.connect("clicked", self._toggle_all)
+        bottom.append(self.all_btn)
+        bottom.append(Gtk.Box(hexpand=True))
+        self.go = Gtk.Button()           # se cierra con la ✕ de la cabecera
+        self.go.add_css_class("suggested-action")
+        self.go.connect("clicked", self._apply)
+        bottom.append(self.go)
+        tv.add_bottom_bar(bottom)
+        self.set_child(tv)
+        self._update()
+
+    def _selected(self):
+        return [f for f, c in self.rows if c.get_active()]
+
+    def _update(self):
+        n = len(self._selected())
+        self.go.set_label(f"Renombrar ({n})")
+        self.go.set_sensitive(n > 0)
+        all_on = bool(self.rows) and n == len(self.rows)
+        self.all_btn.set_label("Desmarcar todos" if all_on else "Marcar todos")
+        self.all_btn.set_sensitive(bool(self.rows))
+
+    def _toggle_all(self, *_):
+        on = len(self._selected()) != len(self.rows)
+        for _f, c in self.rows:
+            c.set_active(on)
+
+    def _apply(self, *_):
+        sel = self._selected()
+        self.go.set_sensitive(False)
+        self.go.set_label("Renombrando…")
+
+        def finished(res):
+            done, errors = res
+            if errors:
+                al = Adw.AlertDialog(heading="Algunos juegos no se renombraron",
+                                     body="No se borró ningún archivo.\n\n" + "\n".join(errors[:20]))
+                al.add_response("ok", "Aceptar")
+                al.present(self.win)
+            self.win.toast(f"{done} juego(s) renombrados")
+            self.close()
+            self.win.library.reload()
+
+        def failed(e):
+            self.win.toast(f"No se pudo renombrar: {e}")
+            self.close()
+            self.win.library.reload()
+        run_bg(lambda: core.apply_name_fixes(sel), finished, failed)
+
+
 # =============================================================== Detalle de un juego
 class GameDialog(Adw.Dialog):
     def __init__(self, win, game):
@@ -645,7 +816,7 @@ class GameDialog(Adw.Dialog):
 
         grp = Adw.PreferencesGroup(title="Nombre en OPL",
                                    description=self._name_hint())
-        self.name_row = Adw.EntryRow(title="Nombre del juego", text=game.title, show_apply_button=True)
+        self.name_row = Adw.EntryRow(title="Nombre del juego", text=core.clean_title(game.title), show_apply_button=True)
         self.name_row.connect("apply", self._rename)
         self.name_row.connect("changed", lambda r: grp.set_description(self._name_hint(r.get_text())))
         grp.add(self.name_row)
@@ -699,7 +870,7 @@ class GameDialog(Adw.Dialog):
             page.append(ag)
 
     def _name_hint(self, text=None):
-        text = self.g.title if text is None else text
+        text = core.clean_title(self.g.title) if text is None else text
         ml = int(self.win.cfg.get("max_name", 32) or 0)
         final = core.opl_filename(self.g.gid, text, core.ext_of(self.g.path), ml)
         return f"Quedará como: {final}"
@@ -1070,8 +1241,11 @@ class InboxPage(Gtk.Box):
             self.progress.set_visible(False)
             msg = f"{ok} juego(s) copiados, {art} imágenes de arte"
             vcds = [i for i in copied_items if core.item_destination(i, cfg)[0] == "vcd"]
-            if vcds and not core.pops_ready(cfg["library"]):
-                msg += " · falta POPS/POPS_IOX.PAK para jugar los de PS1"
+            app_errors = {i.extra["pops_app_error"] for i in vcds if i.extra.get("pops_app_error")}
+            if app_errors:
+                msg += " · PS1 sin acceso en APPS: " + "; ".join(sorted(app_errors))
+            elif vcds and not core.pops_ready(cfg["library"]):
+                msg += " · falta POPS/POPS_IOX.PAK para jugar los de PS1 (agrégalo en Ajustes)"
             self.win.job_finished("Copia terminada", msg + (f" · {len(errors)} con error" if errors else ""))
             if copied_items and self.win.cfg.get("trash_after_copy"):
                 trash_paths(self.win, core.cleanup_targets(copied_items), self.reload)
@@ -1197,6 +1371,20 @@ class SettingsDialog(Adw.PreferencesDialog):
         cur = cfg.get("ps1_mode", "vcd")
         mode_row.set_selected(modes.index(cur) if cur in modes else 0)
         g1.add(mode_row)
+        apps = Adw.SwitchRow(title="Mostrar los juegos de PS1 en OPL",
+                             subtitle="Crea APPS/&lt;juego&gt;/XX.&lt;juego&gt;.ELF (copia de POPSTARTER.ELF) y title.cfg para "
+                                      "cada .VCD, así aparecen en Aplicaciones de OPL.",
+                             active=bool(cfg.get("pops_apps", True)))
+        apps.connect("notify::active", lambda r, _p: self._set("pops_apps", r.get_active(), reload=False))
+        g1.add(apps)
+        self.pops_row = Adw.ActionRow(title="Archivos de POPS guardados en este equipo")
+        add_pops = Gtk.Button(label="Agregar…", valign=Gtk.Align.CENTER,
+                              tooltip_text="Elegir POPSTARTER.ELF o POPS_IOX.PAK. Se copian a la unidad solo si "
+                                           "allí faltan.")
+        add_pops.connect("clicked", self._add_pops_file)
+        self.pops_row.add_suffix(add_pops)
+        self._update_pops_row()
+        g1.add(self.pops_row)
         ps1 = Adw.EntryRow(title="Carpeta de la biblioteca para .bin/.cue de PS1", text=core.ps1_dir(cfg),
                            show_apply_button=True)
         ps1.connect("apply", lambda r: (self._set("ps1_dir", core.ps1_dir({"ps1_dir": r.get_text()})),
@@ -1329,6 +1517,31 @@ class SettingsDialog(Adw.PreferencesDialog):
             d.select_folder(self.win, None, chosen)
         btn.connect("clicked", pick)
         return row
+
+    def _update_pops_row(self):
+        have = [n for n in core.POPS_FILES if core.pops_store_file(n)]
+        missing = [n for n in core.POPS_FILES if n not in have]
+        txt = ("✔ " + ", ".join(have)) if have else ""
+        if missing:
+            txt += ("  ·  " if txt else "") + "Falta: " + ", ".join(missing)
+        self.pops_row.set_subtitle(txt + "\nSe toman solos de un pendrive que los tenga y se copian a los que no.")
+
+    def _add_pops_file(self, *_):
+        d = Gtk.FileDialog(title="Elegir POPSTARTER.ELF o POPS_IOX.PAK")
+
+        def chosen(dialog, res):
+            try:
+                path = dialog.open_finish(res).get_path()
+            except GLib.Error:
+                return
+            try:
+                name = core.import_pops_file(path)
+            except (OSError, ValueError) as e:
+                self.win.toast(f"No se pudo agregar: {e}")
+                return
+            self._update_pops_row()
+            self.win.toast(f"{name} guardado")
+        d.open(self.win, None, chosen)
 
     def _set(self, key, value, reload=True):
         self.win.cfg[key] = value

@@ -200,5 +200,118 @@ class TestImportPS1(unittest.TestCase):
                       core.ART_BASE.format(console="PS1", id="SCUS_949.00", t="COV"))
 
 
+class TestPopsApps(unittest.TestCase):
+    """Accesos en APPS/ para que OPL muestre los juegos de PS1 (como el ejemplo hecho a mano)."""
+    ELF = b"\x7fELF" + b"\0" * 4000
+    PAK = b"PAK" + b"\0" * 4000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lib = os.path.join(self.tmp.name, "usb")
+        self.store = os.path.join(self.tmp.name, "store")
+        self._old_store = core.POPS_STORE
+        core.POPS_STORE = self.store
+        os.makedirs(os.path.join(self.lib, "POPS"))
+
+    def tearDown(self):
+        core.POPS_STORE = self._old_store
+        self.tmp.cleanup()
+
+    def _put(self, rel, data=b"x"):
+        p = os.path.join(self.lib, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_app_like_manual_example(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/Castlevania_Symphony_of_the_Night.VCD")
+        d = core.make_pops_app(self.lib, vcd)
+        self.assertEqual(d, os.path.join(self.lib, "APPS", "Castlevania_Symphony_of_the_Night"))
+        with open(os.path.join(d, "title.cfg"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "title=Castlevania Symphony of the Night\n"
+                                       "boot=XX.Castlevania_Symphony_of_the_Night.ELF\n")
+        with open(os.path.join(d, "XX.Castlevania_Symphony_of_the_Night.ELF"), "rb") as f:
+            self.assertEqual(f.read(), self.ELF)
+        self.assertEqual(core.make_pops_app(self.lib, vcd), "")      # ya estaba: no se toca
+
+    def test_title_without_code(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/SLUS_000.67.Castlevania.VCD")
+        d = core.make_pops_app(self.lib, vcd)
+        with open(os.path.join(d, "title.cfg"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "title=Castlevania\nboot=XX.SLUS_000.67.Castlevania.ELF\n")
+
+    def test_missing_popstarter(self):
+        vcd = self._put("POPS/Juego.VCD")
+        with self.assertRaises(FileNotFoundError):
+            core.make_pops_app(self.lib, vcd)
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "APPS")))
+
+    def test_files_learned_and_copied_to_other_drive(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        self._put("POPS/POPS_IOX.PAK", self.PAK)
+        self.assertEqual(sorted(core.learn_pops_files(self.lib)), ["POPSTARTER.ELF", "POPS_IOX.PAK"])
+        other = os.path.join(self.tmp.name, "otro")
+        os.makedirs(os.path.join(other, "POPS"))
+        copied, missing = core.ensure_pops_files(other)
+        self.assertEqual((sorted(copied), missing), (["POPSTARTER.ELF", "POPS_IOX.PAK"], []))
+        with open(os.path.join(other, "POPS", "POPS_IOX.PAK"), "rb") as f:
+            self.assertEqual(f.read(), self.PAK)
+        self.assertEqual(core.ensure_pops_files(other), ([], []))     # ya estaban: no se copia de nuevo
+
+    def test_existing_files_never_replaced(self):
+        self._put("POPS/popstarter.elf", self.ELF)                    # FAT: mayúsculas da igual
+        os.makedirs(self.store)
+        with open(os.path.join(self.store, "POPS_IOX.PAK"), "wb") as f:
+            f.write(self.PAK)
+        copied, missing = core.ensure_pops_files(self.lib)
+        self.assertEqual((copied, missing), (["POPS_IOX.PAK"], []))
+        self.assertNotIn("POPSTARTER.ELF", os.listdir(os.path.join(self.lib, "POPS")))
+
+    def test_import_rejects_non_elf(self):
+        bad = self._put("POPS/cosa.ELF", b"no soy un elf" * 200)
+        with self.assertRaises(ValueError):
+            core.import_pops_file(bad)
+        good = self._put("POPS/otro.elf", self.ELF)
+        self.assertEqual(core.import_pops_file(good), "POPSTARTER.ELF")
+
+    def test_rename_moves_app(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/Crash.VCD")
+        core.make_pops_app(self.lib, vcd)
+        g = core.Game(vcd, "POPS", "SCUS_944.26", "Crash", 1, self.lib)
+        new = core.rename_to(g, "SCUS_944.26.Crash Bandicoot.VCD")
+        d = os.path.join(self.lib, "APPS", "SCUS_944.26.Crash Bandicoot")
+        self.assertTrue(os.path.isfile(os.path.join(d, "XX.SCUS_944.26.Crash Bandicoot.ELF")))
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "APPS", "Crash")))
+        with open(os.path.join(d, "title.cfg"), encoding="utf-8") as f:
+            self.assertIn("boot=XX.SCUS_944.26.Crash Bandicoot.ELF\n", f.read())
+        self.assertTrue(core.has_pops_app(self.lib, new))
+        self.assertEqual(core.missing_pops_apps(core.scan_library(self.lib)), [])
+
+    def test_app_art_linked_and_follows_rename(self):
+        import zlib, struct
+        def png():
+            raw = b"\0\0\0\0"
+            chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+            return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/SCUS_944.26.Crash.VCD")
+        self._put("ART/SCUS_944.26_COV.png", png())
+        self._put("ART/SCUS_944.26_BG.png", png())
+        core.make_pops_app(self.lib, vcd)
+        g = core.scan_library(self.lib)[0]
+        self.assertEqual(core.sync_pops_app_art([g]), 2)
+        art = os.path.join(self.lib, "ART")
+        self.assertTrue(os.path.isfile(os.path.join(art, "XX.SCUS_944.26.Crash.ELF_COV.png")))
+        self.assertTrue(os.path.isfile(os.path.join(art, "XX.SCUS_944.26.Crash.ELF_BG.png")))
+        self.assertEqual(core.sync_pops_app_art([g]), 0)               # no se copia dos veces
+        core.rename_to(g, "SCUS_944.26.Crash Bandicoot.VCD")
+        self.assertTrue(os.path.isfile(os.path.join(art, "XX.SCUS_944.26.Crash Bandicoot.ELF_COV.png")))
+        self.assertFalse(os.path.exists(os.path.join(art, "XX.SCUS_944.26.Crash.ELF_COV.png")))
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,10 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 - Filtro de juegos sin portada y botón para **descargar todo el arte que falte**: portada, contraportada,
   lomo, logo, ícono, fondo y capturas, con los nombres que usa OPL (`ART/SLUS_209.46_COV.png`…).
 - Al hacer clic en un juego: renombrarlo al formato OPL, bajar su arte o cambiarle la portada.
+- **Corregir nombres**: detecta los juegos que ya están en el pendrive sin el formato de OPL (`God of War.iso`,
+  `Tekken_5 [SLUS-21059].iso`…) y los renombra todos de una vez a `CÓDIGO.Nombre.iso`, mostrando antes cómo quedará
+  cada uno. Nunca pisa otro archivo, en PS1 renombra también la carpeta de partidas guardadas, y el filtro
+  «Nombre sin formato» los muestra en la biblioteca.
 - **Duplicados**: detecta ISOs con el mismo código y te deja elegir cuál conservar; las demás van a la papelera.
 - **Clic derecho en un juego**: ver detalles, cambiar nombre, descargar arte, cambiar portada, abrir carpeta,
   copiar el nombre del archivo o moverlo a la papelera (opcionalmente con su arte).
@@ -44,8 +48,15 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
   También lleva la portada local y descarga el arte.
 - **Juegos de PS1 → POPS**: convierte los `.bin`/`.cue` a `POPS/SCUS_949.00.Nombre.VCD` (formato de cue2pops),
   sin archivos intermedios. Acepta dumps de un solo `.bin`, dumps Redump con una pista por archivo y cues de CDRWIN
-  con PREGAP. Para jugarlos, la unidad necesita `POPSTARTER.ELF` y `POPS/POPS_IOX.PAK` (no se incluyen).
-  En Ajustes se puede elegir copiar los `.bin`/`.cue` tal cual.
+  con PREGAP. En Ajustes se puede elegir copiar los `.bin`/`.cue` tal cual.
+- **Los juegos de PS1 aparecen en OPL** (Aplicaciones): por cada `.VCD` se crea `APPS/<nombre>/XX.<nombre>.ELF`
+  (copia de `POPSTARTER.ELF`; POPStarter busca `POPS/<nombre>.VCD` por el nombre del ELF) y `title.cfg`
+  (`title=` y `boot=`). El arte del juego se copia como `ART/XX.<nombre>.ELF_COV.png`, `_BG`, etc., porque OPL busca
+  el arte de las apps por el nombre del ELF. Al renombrar o borrar el juego, el acceso y su arte lo acompañan.
+  Para los `.VCD` que ya estaban, el botón «Mostrar PS1 en OPL» los crea.
+- **`POPSTARTER.ELF` y `POPS/POPS_IOX.PAK`** no vienen con la app (`POPS_IOX.PAK` es de Sony). La primera vez que
+  aparecen en un pendrive se guarda una copia en `~/.local/share/opl-manager/pops/` (o se eligen en Ajustes) y se
+  copian solos a las unidades donde falten. Nunca se reemplazan los que ya están.
 - **Arte de PS1**: portada, contraportada, lomo, logo, fondo y capturas también para los juegos de POPS.
 - **Limpiar** (botón 🗑): mueve a la papelera los juegos que ya copiaste o los que selecciones. Si el juego está en su
   propia carpeta, se va la carpeta entera (con sus `.url`, `.txt`, portadas…). También puede hacerlo solo después de

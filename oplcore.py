@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import pops
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     "inboxes": [_downloads_dir()],   # carpetas de ROMs a revisar (bandeja de entrada)
     "library": "",              # vacío: al abrir se busca sola la unidad con OPL
     "ps1_mode": "vcd",          # PS1: "vcd" = convertir a POPS/*.VCD · "copy" = copiar los .bin/.cue a ps1_dir
+    "pops_apps": True,          # PS1: crear APPS/<juego>/XX.<juego>.ELF + title.cfg para verlos en OPL
     "ps1_dir": "CD",            # carpeta de la biblioteca donde van los .bin/.cue de PS1 (modo "copy")
     "max_name": 32,             # 0 = sin límite (OPL nuevo)
     "download_art": True,
@@ -363,16 +364,108 @@ def find_duplicates(games):
     return groups
 
 
+def _move(src, dst):
+    """os.rename que también sirve para cambiar solo mayúsculas/minúsculas en FAT32/exFAT
+    (ahí 'juego.iso' y 'Juego.iso' son el mismo archivo y exists() da True)."""
+    if os.path.exists(dst):
+        same = src.lower() == dst.lower() and os.path.samefile(src, dst)
+        if not same:
+            raise FileExistsError(f"Ya existe: {os.path.basename(dst)}")
+        tmp = free_path(src + ".renombrando")
+        os.rename(src, tmp)
+        src = tmp
+    os.rename(src, dst)
+
+
+def rename_to(game, new_name):
+    """Renombra el archivo del juego a new_name (solo el nombre, nunca una ruta). No borra nada.
+    En POPS también renombra la carpeta de partidas guardadas (POPS/<nombre sin .VCD>/)."""
+    if not new_name or os.sep in new_name or new_name in (".", "..") or "\x00" in new_name:
+        raise ValueError(f"Nombre de archivo no válido: {new_name!r}")
+    folder = os.path.dirname(game.path)
+    new = os.path.join(folder, new_name)
+    if new == game.path:
+        return new
+    _move(game.path, new)
+    if game.kind == "POPS":
+        old_dir = os.path.splitext(game.path)[0]
+        new_dir = os.path.splitext(new)[0]
+        if os.path.isdir(old_dir) and not os.path.islink(old_dir):
+            try:
+                _move(old_dir, new_dir)
+            except OSError:
+                pass        # la carpeta de destino ya existe: se deja todo como estaba
+        try:
+            _rename_pops_app(game.library, game.path, new)
+        except OSError:
+            pass
+    return new
+
+
 def rename_game(game, new_title, max_len=32):
     """Renombra el archivo del juego (no borra nada). Devuelve la nueva ruta."""
     ext = os.path.splitext(game.path)[1][1:]          # se conserva tal cual (p. ej. .VCD en mayúsculas)
-    new = os.path.join(os.path.dirname(game.path), opl_filename(game.gid, new_title, ext, max_len))
-    if new == game.path:
-        return new
-    if os.path.exists(new):
-        raise FileExistsError(f"Ya existe: {os.path.basename(new)}")
-    os.rename(game.path, new)
-    return new
+    return rename_to(game, opl_filename(game.gid, new_title, ext, max_len))
+
+
+# código metido en el medio del nombre: "God of War [SLUS-20678]", "(SLES_533.66)"
+_EMBEDDED_ID = re.compile(r"[\[({]?\s*\b[A-Z]{4}[_-]\d{3}\.?\d{2}\b\s*[\])}]?")
+
+
+def clean_title(title):
+    """Título sin el código del juego repetido adentro (ya va al principio del nombre)."""
+    t = _EMBEDDED_ID.sub(" ", title)
+    t = re.sub(r"[\[({]\s*[\])}]", " ", t)
+    t = re.sub(r"\s+", " ", t.replace("_", " ")).strip(" .-_,")
+    return t or title
+
+
+@dataclass
+class NameFix:
+    game: Game
+    new_name: str
+    problem: str = ""     # si no se puede renombrar (p. ej. ya existe un archivo con ese nombre)
+
+
+def name_fixes(games, max_len=32):
+    """Juegos cuyo archivo no sigue el formato de OPL (CÓDIGO.Nombre.iso) y el nombre que les corresponde."""
+    fixes, planned = [], set()
+    for g in games:
+        ext = os.path.splitext(g.path)[1][1:]
+        try:
+            new = opl_filename(g.gid, clean_title(g.title), ext, max_len)
+        except ValueError:
+            continue
+        if new == g.filename:
+            continue
+        dst = os.path.join(os.path.dirname(g.path), new)
+        key = dst.lower()                     # FAT32/exFAT no distinguen mayúsculas
+        problem = ""
+        if key in planned:
+            problem = "Otro juego quedaría con el mismo nombre"
+        elif os.path.exists(dst) and not (key == g.path.lower() and os.path.samefile(dst, g.path)):
+            problem = "Ya existe un archivo con ese nombre"
+        else:
+            planned.add(key)
+        fixes.append(NameFix(g, new, problem))
+    return fixes
+
+
+def apply_name_fixes(fixes, progress=None):
+    """Renombra los juegos de la lista. Devuelve (renombrados, [errores])."""
+    done, errors = 0, []
+    for i, f in enumerate(fixes):
+        if progress:
+            progress(i, len(fixes), f.game.filename)
+        if f.problem:
+            errors.append(f"{f.game.filename}: {f.problem}")
+            continue
+        try:
+            rename_to(f.game, f.new_name)
+            done += 1
+        except (OSError, ValueError) as e:
+            errors.append(f"{f.game.filename}: {e}")
+    return done, errors
 
 
 def save_cover(library, gid, image_path, overwrite=False):
@@ -810,7 +903,15 @@ def import_item(item, cfg, progress=None):
         copied = [target]
     else:
         copied = _copy_item(item, dest_dir, name, lib, progress)
-    return copied, _import_art(item, cfg, lib)
+    art = _import_art(item, cfg, lib)
+    if action == "vcd" and cfg.get("pops_apps", True):
+        try:
+            ensure_pops_files(lib)
+            make_pops_app(lib, target)
+            link_pops_app_art(Game(target, "POPS", item.gid if valid_gid(item.gid) else "", "", 0, lib))
+        except (OSError, ValueError) as e:
+            item.extra["pops_app_error"] = str(e)
+    return copied, art
 
 
 def _copy_item(item, dest_dir, name, lib, progress):
@@ -877,6 +978,210 @@ def item_destination(item, cfg):
     if item.multi:
         return "copy", ps1_dir(cfg), ""
     return "copy", ps1_dir(cfg), opl_filename(item.gid, item.title, ext_of(item.main), max_len)
+
+
+# ---------------------------------------------------------------- POPStarter: archivos y accesos en APPS/
+# POPSTARTER.ELF y POPS_IOX.PAK no se distribuyen con la app (POPS_IOX.PAK es de Sony). Se guarda una copia
+# local la primera vez que aparecen en una unidad (o que el usuario los elige) y se ponen en las unidades
+# donde falten.
+POPS_STORE = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"),
+                          "opl-manager", "pops")
+POPS_FILES = ("POPSTARTER.ELF", "POPS_IOX.PAK")
+_POPS_MAX = 16 * 1024 * 1024
+
+
+def _find_ci(folder, name):
+    """Ruta de folder/name sin importar mayúsculas (FAT/exFAT), o ''."""
+    try:
+        for n in os.listdir(folder):
+            if n.upper() == name.upper():
+                return os.path.join(folder, n)
+    except OSError:
+        pass
+    return ""
+
+
+def _valid_pops_file(name, path):
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if not 1024 <= size <= _POPS_MAX:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    return head == b"\x7fELF" if name == "POPSTARTER.ELF" else True
+
+
+def _copy_atomic(src, dst):
+    tmp = dst + ".part"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def pops_store_file(name):
+    p = os.path.join(POPS_STORE, name)
+    return p if _valid_pops_file(name, p) else ""
+
+
+def learn_pops_files(library):
+    """Guarda en el equipo los archivos de POPS que tenga la unidad y falten en la copia local."""
+    learned = []
+    for name in POPS_FILES:
+        src = _find_ci(os.path.join(library, "POPS"), name)
+        if not pops_store_file(name) and src and _valid_pops_file(name, src):
+            os.makedirs(POPS_STORE, exist_ok=True)
+            _copy_atomic(src, os.path.join(POPS_STORE, name))
+            learned.append(name)
+    return learned
+
+
+def import_pops_file(path):
+    """El usuario eligió un archivo: se guarda como POPSTARTER.ELF o POPS_IOX.PAK. Devuelve cuál fue."""
+    base = os.path.basename(path).upper()
+    if base == "POPS_IOX.PAK":
+        name = "POPS_IOX.PAK"
+    elif _valid_pops_file("POPSTARTER.ELF", path):
+        name = "POPSTARTER.ELF"
+    else:
+        raise ValueError("No es POPSTARTER.ELF (un ejecutable ELF) ni POPS_IOX.PAK")
+    if not _valid_pops_file(name, path):
+        raise ValueError(f"{os.path.basename(path)} no parece un {name} válido")
+    os.makedirs(POPS_STORE, exist_ok=True)
+    _copy_atomic(path, os.path.join(POPS_STORE, name))
+    return name
+
+
+def ensure_pops_files(library):
+    """Pone en POPS/ de la unidad los archivos que falten, desde la copia local.
+    Devuelve (copiados, todavía faltantes)."""
+    learn_pops_files(library)
+    d = os.path.join(library, "POPS")
+    copied, missing = [], []
+    for name in POPS_FILES:
+        if _find_ci(d, name):
+            continue
+        src = pops_store_file(name)
+        if not src:
+            missing.append(name)
+            continue
+        os.makedirs(d, exist_ok=True)
+        _copy_atomic(src, os.path.join(d, name))
+        copied.append(name)
+    return copied, missing
+
+
+def pops_app_dir(library, vcd_path):
+    return os.path.join(library, "APPS", os.path.splitext(os.path.basename(vcd_path))[0])
+
+
+def _pops_app_files(stem):
+    return f"XX.{stem}.ELF", "title.cfg"
+
+
+def _app_title(stem):
+    return clean_title(strip_id(stem)) or stem
+
+
+def has_pops_app(library, vcd_path):
+    d = pops_app_dir(library, vcd_path)
+    elf, cfg = _pops_app_files(os.path.basename(d))
+    return bool(_find_ci(d, elf)) and bool(_find_ci(d, cfg))
+
+
+def _write_title_cfg(path, title, boot):
+    title = re.sub(r"[\r\n=]", " ", title).strip()
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"title={title}\nboot={boot}\n")
+
+
+def make_pops_app(library, vcd_path):
+    """Acceso para que OPL muestre el juego de PS1 en Aplicaciones:
+    APPS/<nombre>/XX.<nombre>.ELF (copia de POPSTARTER.ELF) y APPS/<nombre>/title.cfg.
+    POPStarter busca POPS/<nombre>.VCD a partir del nombre del ELF. No pisa nada que ya exista.
+    Devuelve la carpeta creada, o '' si ya estaba."""
+    if has_pops_app(library, vcd_path):
+        return ""
+    stem = os.path.splitext(os.path.basename(vcd_path))[0]
+    if not stem or stem.startswith(".") or os.sep in stem:
+        raise ValueError(f"Nombre de juego no válido: {stem!r}")
+    elf_src = _find_ci(os.path.join(library, "POPS"), "POPSTARTER.ELF")
+    if not (elf_src and _valid_pops_file("POPSTARTER.ELF", elf_src)):
+        elf_src = pops_store_file("POPSTARTER.ELF")
+    if not elf_src:
+        raise FileNotFoundError("Falta POPSTARTER.ELF (agrégalo en Ajustes)")
+    d = pops_app_dir(library, vcd_path)
+    os.makedirs(d, exist_ok=True)
+    elf, cfg = _pops_app_files(stem)
+    if not _find_ci(d, elf):
+        _copy_atomic(elf_src, os.path.join(d, elf))
+    if not _find_ci(d, cfg):
+        _write_title_cfg(os.path.join(d, cfg), _app_title(stem), elf)
+    return d
+
+
+def pops_app_art_name(vcd_path, t):
+    """OPL busca el arte de una app por el nombre de su ELF: ART/XX.<nombre>.ELF_COV.png"""
+    stem = os.path.splitext(os.path.basename(vcd_path))[0]
+    return f"{_pops_app_files(stem)[0]}_{t}.png"
+
+
+def pops_app_art_files(library, vcd_path):
+    art = os.path.join(library, "ART")
+    return [p for t in ART_TYPES if os.path.isfile(p := os.path.join(art, pops_app_art_name(vcd_path, t)))]
+
+
+def link_pops_app_art(game):
+    """Copia el arte del juego (ART/<código>_COV.png...) con el nombre que OPL usa para su app.
+    Copia y no enlace: exFAT/FAT32 no tienen enlaces simbólicos. Nunca pisa nada. Devuelve cuántas copió."""
+    if game.kind != "POPS" or not game.gid or not has_pops_app(game.library, game.path):
+        return 0
+    n = 0
+    for t in ART_TYPES:
+        src = game.art(t)
+        dst = os.path.join(game.library, "ART", pops_app_art_name(game.path, t))
+        if src and not os.path.exists(dst) and _is_plain_png(src):
+            _copy_atomic(src, dst)
+            n += 1
+    return n
+
+
+def sync_pops_app_art(games):
+    n = 0
+    for g in games:
+        try:
+            n += link_pops_app_art(g)
+        except OSError:
+            pass
+    return n
+
+
+def missing_pops_apps(games):
+    return [g for g in games if g.kind == "POPS" and not has_pops_app(g.library, g.path)]
+
+
+def _rename_pops_app(library, old_vcd, new_vcd):
+    """El acceso de APPS/ sigue al .VCD cuando se renombra (si no, POPStarter no lo encuentra)."""
+    old_d, new_d = pops_app_dir(library, old_vcd), pops_app_dir(library, new_vcd)
+    if not os.path.isdir(old_d) or os.path.islink(old_d):
+        return
+    old_stem, new_stem = os.path.basename(old_d), os.path.basename(new_d)
+    old_elf = _find_ci(old_d, _pops_app_files(old_stem)[0])
+    if not old_elf:
+        return          # carpeta que no es nuestra: no se toca
+    _move(old_d, new_d)
+    new_elf = _pops_app_files(new_stem)[0]
+    _move(os.path.join(new_d, os.path.basename(old_elf)), os.path.join(new_d, new_elf))
+    cfg = _find_ci(new_d, "title.cfg")
+    if cfg:
+        _write_title_cfg(cfg, _app_title(new_stem), new_elf)
+    for t in ART_TYPES:                   # el arte de la app va por el nombre del ELF
+        old_art = os.path.join(library, "ART", pops_app_art_name(old_vcd, t))
+        new_art = os.path.join(library, "ART", pops_app_art_name(new_vcd, t))
+        if os.path.isfile(old_art) and not os.path.exists(new_art):
+            _move(old_art, new_art)
 
 
 def pops_ready(library):

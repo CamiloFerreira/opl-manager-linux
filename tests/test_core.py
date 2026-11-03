@@ -166,5 +166,71 @@ class TestSecurity(unittest.TestCase):
             self.assertTrue(core._is_plain_png(secret))
 
 
+class TestNameFixes(unittest.TestCase):
+    def _lib(self, d, files):
+        for rel in files:
+            p = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(b"x")
+
+    def _game(self, d, rel, gid):
+        kind = rel.split("/")[0]
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        return core.Game(os.path.join(d, rel), kind, gid, core.strip_id(stem), 1, d)
+
+    def test_clean_title(self):
+        self.assertEqual(core.clean_title("God of War [SLUS-20678]"), "God of War")
+        self.assertEqual(core.clean_title("Killer7 (SLES_533.66) [PAL]"), "Killer7 [PAL]")
+        self.assertEqual(core.clean_title("Silent_Hill_2"), "Silent Hill 2")
+        self.assertEqual(core.clean_title("Tekken 5"), "Tekken 5")
+
+    def test_detects_and_renames(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._lib(d, ["DVD/God of War [SLUS-20678].iso", "DVD/SLUS_209.46.GTA San Andreas.iso",
+                          "DVD/SLES-533.66 Killer7.iso", "POPS/Crash.VCD", "POPS/Crash/SLOT0.VMC"])
+            games = [self._game(d, "DVD/God of War [SLUS-20678].iso", "SLUS_206.78"),
+                     self._game(d, "DVD/SLUS_209.46.GTA San Andreas.iso", "SLUS_209.46"),
+                     self._game(d, "DVD/SLES-533.66 Killer7.iso", "SLES_533.66"),
+                     self._game(d, "POPS/Crash.VCD", "SCUS_944.26")]
+            fixes = core.name_fixes(games)
+            self.assertEqual(sorted(f.new_name for f in fixes),
+                             ["SCUS_944.26.Crash.VCD", "SLES_533.66.Killer7.iso", "SLUS_206.78.God of War.iso"])
+            done, errors = core.apply_name_fixes(fixes)
+            self.assertEqual((done, errors), (3, []))
+            self.assertTrue(os.path.isfile(os.path.join(d, "DVD", "SLUS_206.78.God of War.iso")))
+            # la carpeta de partidas de POPS acompaña al .VCD
+            self.assertTrue(os.path.isfile(os.path.join(d, "POPS", "SCUS_944.26.Crash", "SLOT0.VMC")))
+            self.assertEqual(core.name_fixes(core.scan_library(d)), [])
+
+    def test_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._lib(d, ["DVD/Tekken 5.iso", "DVD/SLUS_210.59.Tekken 5.iso", "DVD/Tekken_5.iso"])
+            games = [self._game(d, "DVD/Tekken 5.iso", "SLUS_210.59"),
+                     self._game(d, "DVD/Tekken_5.iso", "SLUS_210.59")]
+            fixes = core.name_fixes(games)
+            self.assertTrue(all(f.problem for f in fixes))
+            done, errors = core.apply_name_fixes(fixes)
+            self.assertEqual(done, 0)
+            self.assertEqual(len(errors), 2)
+            self.assertEqual(len(os.listdir(os.path.join(d, "DVD"))), 3)
+
+    def test_same_target_only_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._lib(d, ["DVD/Tekken 5.iso", "DVD/Tekken_5.iso"])
+            games = [self._game(d, "DVD/Tekken 5.iso", "SLUS_210.59"),
+                     self._game(d, "DVD/Tekken_5.iso", "SLUS_210.59")]
+            fixes = core.name_fixes(games)
+            self.assertEqual([bool(f.problem) for f in fixes], [False, True])
+
+    def test_rename_rejects_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._lib(d, ["DVD/a.iso"])
+            g = self._game(d, "DVD/a.iso", "")
+            for bad in ("../a.iso", "", ".."):
+                with self.assertRaises(ValueError):
+                    core.rename_to(g, bad)
+
+
 if __name__ == "__main__":
     unittest.main()
