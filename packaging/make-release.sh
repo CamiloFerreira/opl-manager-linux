@@ -3,7 +3,8 @@
 #   opl-manager                       ejecutable de un archivo (zipapp de Python)
 #   opl-manager_<versión>_all.deb     paquete para Ubuntu/Debian (instala dependencias con apt)
 #   opl-manager-linux-<versión>.tar.gz  código fuente con install.sh
-#   SHA256SUMS
+#   release.json                      manifiesto (versión, versión mínima segura)
+#   SHA256SUMS + SHA256SUMS.sig       sumas y su firma Ed25519 (si hay clave)
 # y dist/release-notes.md con las notas del release.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -59,10 +60,32 @@ else
       --transform "s,^\.,opl-manager-linux-$VERSION," -C "$ROOT" .
 fi
 
-# ---- 4) sumas de verificación
-( cd "$OUT" && sha256sum -- * > SHA256SUMS )
+# ---- 4) manifiesto: versión y versión mínima segura (las anteriores deben actualizarse sí o sí)
+python3 - "$VERSION" "$ROOT/packaging/security.json" "$OUT/release.json" <<'PY'
+import json, re, sys
+version, policy, out = sys.argv[1:]
+sec = json.load(open(policy, encoding="utf-8"))
+msv = sec.get("min_safe_version", "0.0.0")
+assert re.fullmatch(r"\d+\.\d+\.\d+", msv), "min_safe_version no válida"
+key = lambda v: tuple(int(x) for x in v.split("."))
+assert key(msv) <= key(version), "min_safe_version no puede ser mayor que la versión publicada"
+json.dump({"version": version, "min_safe_version": msv, "advisory": sec.get("advisory", "")},
+          open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PY
 
-# ---- 5) notas del release
+# ---- 5) sumas de verificación y firma Ed25519 (la app no instala nada sin firma válida)
+( cd "$OUT" && sha256sum -- * > SHA256SUMS )
+if [[ -n "${OPL_SIGNING_KEY_FILE:-}" ]]; then
+  openssl pkeyutl -sign -inkey "$OPL_SIGNING_KEY_FILE" -rawin -in "$OUT/SHA256SUMS" -out "$OUT/SHA256SUMS.sig"
+  python3 "$ROOT/updater.py" verify "$OUT/SHA256SUMS" "$OUT/SHA256SUMS.sig"   # con la clave pública de la app
+elif [[ "${OPL_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
+  echo "::error::Falta la clave de firma (OPL_SIGNING_KEY_FILE): no se publica un release sin firmar" >&2
+  exit 1
+else
+  echo "(sin firmar: build de prueba)"
+fi
+
+# ---- 6) notas del release
 cat > "$ROOT/dist/release-notes.md" <<EOF
 ## Instalar
 
@@ -82,7 +105,19 @@ chmod +x opl-manager
 **Desde el código:** descomprime \`opl-manager-linux-${VERSION}.tar.gz\` y ejecuta \`./install.sh\`.
 
 Verificar las descargas: \`sha256sum -c SHA256SUMS --ignore-missing\`
+
+Verificar la firma (clave pública Ed25519 del proyecto en \`updater.py\`): \`python3 updater.py verify SHA256SUMS SHA256SUMS.sig\`
+o la procedencia del build: \`gh attestation verify opl-manager --repo CamiloFerreira/opl-manager-linux\`
 EOF
+python3 - "$OUT/release.json" "$ROOT/dist/release-notes.md" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+if m["min_safe_version"] == m["version"] and m.get("advisory"):
+    notes = open(sys.argv[2], encoding="utf-8").read()
+    head = ("## ⚠️ Actualización de seguridad obligatoria\n\n" + m["advisory"] +
+            "\n\nLas versiones anteriores a " + m["version"] + " deben actualizarse.\n\n")
+    open(sys.argv[2], "w", encoding="utf-8").write(head + notes)
+PY
 
 echo "== Archivos en dist/release:"
 ls -la "$OUT"

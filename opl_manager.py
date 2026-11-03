@@ -2,7 +2,6 @@
 """OPL Manager para Linux — gestor de la biblioteca de Open PS2 Loader (GTK 4 + libadwaita)."""
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -1237,13 +1236,14 @@ class SettingsDialog(Adw.PreferencesDialog):
         g3 = Adw.PreferencesGroup(title="Actualizaciones",
                                   description=f"Versión {core.__version__} · {how}")
         au = Adw.SwitchRow(title="Buscar actualizaciones automáticamente",
-                           subtitle="Al abrir la app, como máximo una vez al día, en los releases de GitHub.",
+                           subtitle="Al abrir la app, como máximo una vez al día, en los releases de GitHub. "
+                                    "Las actualizaciones de seguridad se instalan siempre.",
                            active=bool(cfg.get("auto_update", True)))
         au.connect("notify::active", lambda r, _p: self._set("auto_update", r.get_active(), reload=False))
         g3.add(au)
         if mode == "self":
             ai = Adw.SwitchRow(title="Instalarlas solas",
-                               subtitle="Se descargan, se verifican (SHA256) y solo tienes que reiniciar.",
+                               subtitle="Se descargan, se verifica su firma digital y solo tienes que reiniciar.",
                                active=bool(cfg.get("auto_install", True)))
             ai.connect("notify::active", lambda r, _p: self._set("auto_install", r.get_active(), reload=False))
             au.bind_property("active", ai, "sensitive", GObject.BindingFlags.SYNC_CREATE)
@@ -1342,6 +1342,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.banner.connect("button-clicked", self._on_banner)
         tv.add_top_bar(self.banner)
         self.pending_release = None
+        self.update_mandatory = False   # corrige vulnerabilidades: no se puede omitir
+        self._sec_dialog = None
         self.update_state = ""          # "available" | "installed"
 
         self.library = LibraryPage(self)
@@ -1411,42 +1413,114 @@ class MainWindow(Adw.ApplicationWindow):
     def check_updates(self, manual=False):
         def done(rel):
             self.cfg["last_update_check"] = time.time()
+            mandatory = updater.is_mandatory(rel, core.__version__)
+            self.cfg["security_update_pending"] = rel["version"] if mandatory else ""
             core.save_config(self.cfg)
             if not updater.is_newer(rel["version"], core.__version__):
                 if manual:
                     self.toast(f"Tienes la última versión ({core.__version__})")
                 return
+            # con las automáticas apagadas solo se actúa si es de seguridad (o si se pidió a mano)
+            if not (manual or mandatory or self.cfg.get("auto_update", True)):
+                return
             self.pending_release = rel
+            self.update_mandatory = mandatory
             mode = updater.install_mode()
-            if mode == "self" and self.cfg.get("auto_install", True):
+            if mandatory:
+                self._security_dialog()
+                if mode == "self":
+                    self._install_update()
+            elif mode == "self" and self.cfg.get("auto_install", True):
                 self._install_update()
             else:
                 self.update_state = "available"
-                self.banner.set_title(f"Hay una nueva versión: {rel['version']} (tienes {core.__version__})")
-                self.banner.set_button_label("Actualizar" if mode != "source" else "Ver novedades")
-                self.banner.set_revealed(True)
+                self._set_banner(f"Hay una nueva versión: {rel['version']} (tienes {core.__version__})",
+                                 "Actualizar" if mode != "source" else "Ver novedades")
 
         def fail(e):
             if manual:
                 self.toast(f"No se pudo buscar actualizaciones: {e}")
         run_bg(updater.latest_release, done, fail)
 
+    def _set_banner(self, title, button=None):
+        self.banner.set_title(GLib.markup_escape_text(title))
+        self.banner.set_button_label(button)
+        self.banner.set_revealed(True)
+
+    def _security_dialog(self, error=""):
+        """Actualización obligatoria: corrige vulnerabilidades. No se puede seguir usando la versión vieja."""
+        rel = self.pending_release
+        mode = updater.install_mode()
+        if getattr(self, "_sec_dialog", None):
+            self._sec_dialog.force_close()
+        body = (f"La versión instalada ({core.__version__}) tiene vulnerabilidades de seguridad corregidas en la "
+                f"{rel['version']}. Es necesario actualizar para seguir usando OPL Manager.")
+        if rel.get("advisory"):
+            body += "\n\n" + rel["advisory"]
+        if error:
+            body += f"\n\nNo se pudo instalar: {error}"
+        dlg = Adw.AlertDialog(heading="Actualización de seguridad obligatoria", body=body)
+        dlg.set_can_close(False)
+        dlg.add_response("quit", "Salir")
+        if self.update_state == "installed":
+            dlg.add_response("go", "Reiniciar ahora")
+        elif mode == "self" and not error:
+            dlg.add_response("go", "Instalando…")
+            dlg.set_response_enabled("go", False)
+        elif mode in ("self", "deb"):
+            dlg.add_response("go", "Reintentar" if error else "Actualizar")
+        else:
+            dlg.add_response("go", "Ver novedades")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("go")
+
+        def resp(_d, r):
+            self._sec_dialog = None
+            if r == "quit":
+                if self.busy():           # no deja un juego copiado a medias
+                    self.quit_when_done = True
+                    self.toast("OPL Manager se cerrará al terminar la copia")
+                else:
+                    self.quit_app()
+            elif self.update_state == "installed":
+                self._restart_when_idle()
+            elif mode in ("self", "deb"):
+                self._install_update()
+            elif mode == "source":
+                Gio.AppInfo.launch_default_for_uri(rel["url"], None)
+                GLib.idle_add(lambda: (self._security_dialog(), False)[1])
+        dlg.connect("response", resp)
+        self._sec_dialog = dlg
+        if not self.get_visible():
+            self.come_back()
+        dlg.present(self)
+
+    def _restart_when_idle(self):
+        """Reinicia en cuanto no haya una copia en curso (no deja juegos a medias)."""
+        if self.inbox.importing:
+            self._set_banner("Actualización de seguridad lista: se reiniciará al terminar la copia")
+            GLib.timeout_add_seconds(2, lambda: (self._restart_when_idle(), False)[1])
+            return
+        updater.restart()
+
     def _install_update(self):
         rel = self.pending_release
-        self.banner.set_title(f"Actualizando a la versión {rel['version']}…")
-        self.banner.set_button_label(None)
-        self.banner.set_revealed(True)
+        self._set_banner(f"Actualizando a la versión {rel['version']}…")
 
         def done(_):
             self.update_state = "installed"
-            self.banner.set_title(f"OPL Manager se actualizó a la versión {rel['version']}")
-            self.banner.set_button_label("Reiniciar")
+            self.cfg["security_update_pending"] = ""
+            core.save_config(self.cfg)
+            self._set_banner(f"OPL Manager se actualizó a la versión {rel['version']}", "Reiniciar")
+            if self.update_mandatory:
+                self._security_dialog()
 
         def fail(e):
             self.update_state = "available"
-            self.banner.set_title(f"No se pudo actualizar a {rel['version']}: {e}")
-            self.banner.set_button_label("Reintentar")
-        run_bg(lambda: updater.apply_update(rel), done, fail)
+            self._set_banner(f"No se pudo actualizar a {rel['version']}: {e}", "Reintentar")
+            if self.update_mandatory:
+                self._security_dialog(str(e))
+        run_bg(lambda: updater.apply_update(rel, core.__version__), done, fail)
 
     def _on_banner(self, *_):
         if self.update_state == "installed":

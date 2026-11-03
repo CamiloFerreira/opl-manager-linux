@@ -62,10 +62,13 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 
 **Actualizaciones automáticas**:
 - Al abrir, como máximo una vez al día, busca versiones nuevas en los releases de GitHub.
-- Si instalaste el ejecutable (`install.sh` o descarga directa), la versión nueva se descarga, se verifica con
-  su SHA256 y se instala sola: solo tienes que pulsar **Reiniciar**.
+- Si instalaste el ejecutable (`install.sh` o descarga directa), la versión nueva se descarga, se verifica su
+  **firma digital Ed25519** y su SHA256, y se instala sola: solo tienes que pulsar **Reiniciar**.
 - Si instalaste el `.deb`, te avisa y la instala con tu contraseña.
 - Se puede desactivar en Ajustes → Actualizaciones, o buscar a mano en el menú ☰ → *Buscar actualizaciones*.
+- **Actualizaciones de seguridad obligatorias**: si la versión instalada tiene vulnerabilidades corregidas en una
+  nueva, la actualización se instala aunque las automáticas estén desactivadas, y la app no se puede seguir usando
+  hasta actualizar (nunca interrumpe una copia en curso). Ver [SECURITY.md](SECURITY.md).
 
 ## Seguridad
 - En la biblioteca nunca se borra ni se sobrescribe nada sin preguntar. Al cambiar una portada, la anterior queda como `.bak`.
@@ -73,6 +76,7 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 - La bandeja no se modifica al copiar: los juegos se **copian**, no se mueven. Solo se limpia cuando tú lo pides,
   siempre con confirmación y a la papelera; si la unidad no tiene papelera, pregunta antes de borrar definitivamente.
 - Cada copia se escribe como `.part` y solo se renombra al terminar completa.
+- Política de seguridad y cómo reportar vulnerabilidades: [SECURITY.md](SECURITY.md).
 
 ## Instalar
 
@@ -105,7 +109,9 @@ python3 -m unittest discover -s tests -v   # pruebas
 ./packaging/make-release.sh                # construye .deb, ejecutable, .tar.gz y SHA256SUMS en dist/release/
 ```
 Para publicar una versión: cambia `__version__` en `oplcore.py`, haz commit y sube un tag `vX.Y.Z`;
-GitHub Actions construye los paquetes y crea el release.
+GitHub Actions construye los paquetes, los firma (secreto `RELEASE_SIGNING_KEY`), genera la atestación de
+procedencia y crea el release. Si la versión corrige vulnerabilidades, sube `min_safe_version` en
+`packaging/security.json` a esa versión: todas las anteriores quedarán obligadas a actualizar.
 
 ## Configuración
 Menú ☰ → Ajustes: biblioteca OPL, carpetas de ROMs, carpeta para PS1, nombres cortos (máx. 32 caracteres para OPL viejo)

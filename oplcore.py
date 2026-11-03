@@ -18,11 +18,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
 ID_PREFIX_RE = re.compile(r"^([A-Z]{4})[_-](\d{3})\.(\d{2})[._ -]")
+GID_RE = re.compile(r"^[A-Z]{4}_\d{3}\.\d{2}$")      # código ya normalizado: SLUS_209.46
+MAX_ART_BYTES = 16 * 1024 * 1024                       # límite por imagen descargada
 
 ROM_EXT = {"iso", "bin", "cue", "img", "chd", "cso", "zso", "mdf", "mds", "nrg", "ecm", "pbp", "ccd", "sub", "m3u"}
 SOLO_EXT = {"iso", "chd", "cso", "zso", "pbp", "nrg"}           # un solo archivo
@@ -94,8 +96,13 @@ def load_config():
     return cfg
 
 
+def valid_gid(gid):
+    """El código de juego tiene la forma exacta SLUS_209.46 (se usa para armar rutas y URLs)."""
+    return bool(gid) and bool(GID_RE.match(gid))
+
+
 def save_config(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -119,9 +126,11 @@ def _cache():
 
 def _save_cache():
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(ID_CACHE_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        tmp = ID_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_cache(), f)
+        os.replace(tmp, ID_CACHE_FILE)
     except OSError:
         pass
 
@@ -152,6 +161,8 @@ def _read_boot_line(path):
                     if n == 0:
                         i = (i // 2048 + 1) * 2048
                         continue
+                    if n < 34 or i + 33 > len(data):      # registro dañado: se deja de leer el índice
+                        break
                     name = data[i + 33:i + 33 + data[i + 32]].split(b";")[0].upper()
                     if name == b"SYSTEM.CNF":
                         elba = int.from_bytes(data[i + 2:i + 6], "little")
@@ -164,7 +175,7 @@ def _read_boot_line(path):
             f.seek(0)
             m = re.search(rb"BOOT2? *= *cdrom0?:[^\r\n;]{0,40}", f.read(8_000_000))
             return m.group(0).decode("latin-1") if m else ""
-        except (OSError, ValueError):
+        except (OSError, ValueError, IndexError, OverflowError):
             return ""
 
 
@@ -176,8 +187,10 @@ def disc_info(path):
         return "", ""
     key = f"{path}|{st.st_size}|{int(st.st_mtime)}"
     c = _cache()
-    if key in c:
-        return tuple(c[key])
+    hit = c.get(key)
+    if isinstance(hit, list) and len(hit) == 2 and hit[0] in ("PS2", "PS1", "") and \
+            (hit[1] == "" or valid_gid(hit[1])):
+        return hit[0], hit[1]
     line = _read_boot_line(path)
     console = "PS2" if line.startswith("BOOT2") else ("PS1" if line.startswith("BOOT") else "")
     m = ID_RE.search(line)
@@ -215,8 +228,9 @@ def short_title(title, max_len=32):
     if max_len:
         t = ascii_name(t)
     t = re.sub(r"\s+", " ", t).strip()
+    fallback = "Juego"
     if not max_len or len(t) <= max_len:
-        return t.rstrip(" .-_,") or title
+        return t.rstrip(" .-_,") or fallback
     while len(t) > max_len:
         new = _TAG_END.sub("", t)
         new = _TAG_START.sub("", new)
@@ -226,12 +240,18 @@ def short_title(title, max_len=32):
     if len(t) > max_len:
         cut = t[:max_len + 1]
         t = cut.rsplit(" ", 1)[0] if " " in cut else t[:max_len]
-    return t.rstrip(" .-_,") or title[:max_len]
+    return t.rstrip(" .-_,") or fallback
 
 
 def opl_filename(gid, title, ext, max_len=32):
-    t = short_title(title, max_len)
-    return f"{gid}.{t}.{ext}" if gid else f"{t}.{ext}"
+    """Nombre de archivo (nunca una ruta: sin '/', sin '..', sin empezar con '.')."""
+    t = short_title(title, max_len).lstrip(". ") or "Juego"
+    ext = re.sub(r"[^a-z0-9]", "", (ext or "").lower())[:8] or "iso"
+    gid = gid if valid_gid(gid) else ""
+    name = f"{gid}.{t}.{ext}" if gid else f"{t}.{ext}"
+    if os.sep in name or name in (".", "..") or "\x00" in name:
+        raise ValueError(f"Nombre de archivo no válido: {name!r}")
+    return name
 
 
 def free_path(path):
@@ -347,21 +367,33 @@ def rename_game(game, new_title, max_len=32):
 def save_cover(library, gid, image_path, overwrite=False):
     """Guarda una imagen como ART/<código>_COV.png (140x200)."""
     from PIL import Image
+    if not valid_gid(gid):
+        raise ValueError("Código de juego no válido")
+    Image.MAX_IMAGE_PIXELS = 40_000_000          # evita "bombas de descompresión"
     dest = os.path.join(library, "ART", f"{gid}_COV.png")
     if os.path.exists(dest) and not overwrite:
         return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
-    Image.open(image_path).convert("RGB").resize((140, 200), Image.LANCZOS).save(tmp, "PNG")
-    os.replace(tmp, dest)
+    try:
+        with Image.open(image_path) as im:
+            im.convert("RGB").resize((140, 200), Image.LANCZOS).save(tmp, "PNG")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return dest
 
 
 def _fetch_png(url):
     try:
+        if not url.startswith("https://"):
+            return None
         req = urllib.request.Request(url, headers={"User-Agent": "opl-manager-linux"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = r.read()
+        with urllib.request.urlopen(req, timeout=20) as r:  # nosec B310 - URL https fija (ART_BASE)
+            data = r.read(MAX_ART_BYTES + 1)
+        if len(data) > MAX_ART_BYTES:
+            return None
         return data if data[:8] == b"\x89PNG\r\n\x1a\n" else None
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -373,12 +405,14 @@ def _fetch_png(url):
 
 def download_art(library, gid, types=None):
     """Descarga el arte que falta. Nunca sobrescribe. Devuelve la lista de tipos descargados."""
-    if not gid:
+    if not valid_gid(gid):
         return []
     art = os.path.join(library, "ART")
     os.makedirs(art, exist_ok=True)
     got = []
     for t in (types or ART_TYPES):
+        if t not in ART_TYPES:
+            continue
         dest = os.path.join(art, f"{gid}_{t}.png")
         if os.path.exists(dest):
             continue
@@ -729,6 +763,17 @@ def _copy_file(src, dst, progress=None, done_before=0, total=0):
     return copied
 
 
+def _is_plain_png(path):
+    """Archivo PNG normal (no enlace simbólico) y de tamaño razonable."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_ART_BYTES:
+            return False
+        with open(path, "rb") as f:
+            return f.read(8) == b"\x89PNG\r\n\x1a\n"
+    except OSError:
+        return False
+
+
 def import_item(item, cfg, progress=None):
     """Copia un juego de la bandeja a la biblioteca (sin borrar nada en ningún lado).
     Devuelve (lista de rutas copiadas, lista de arte agregado)."""
@@ -770,7 +815,7 @@ def import_item(item, cfg, progress=None):
         os.makedirs(art_dir, exist_ok=True)
         for t, p in item.extra.get("inbox_art", {}).items():
             dest = os.path.join(art_dir, f"{item.gid}_{t}.png")
-            if not os.path.exists(dest):
+            if t in ART_TYPES and valid_gid(item.gid) and not os.path.exists(dest) and _is_plain_png(p):
                 shutil.copyfile(p, dest)
                 art.append(t)
         if item.cover and not os.path.exists(os.path.join(art_dir, f"{item.gid}_COV.png")):

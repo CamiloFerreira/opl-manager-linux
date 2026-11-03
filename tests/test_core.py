@@ -123,5 +123,48 @@ class TestCleanup(unittest.TestCase):
             self.assertEqual([os.path.relpath(t, inbox) for t in core.cleanup_targets(both)], ["Pack"])
 
 
+class TestSecurity(unittest.TestCase):
+    def test_filename_never_escapes_folder(self):
+        for title in ("/", "///", "..", "../../etc/passwd", "", "\x00", "?*<>"):
+            for ml in (32, 0):
+                name = core.opl_filename("SLUS_209.46", title, "iso", ml)
+                self.assertNotIn("/", name)
+                self.assertFalse(name.startswith("."))
+                self.assertEqual(os.path.basename(name), name)
+        self.assertEqual(core.opl_filename("../../x", "Juego", "iso"), "Juego.iso")   # código inválido: se ignora
+
+    def test_valid_gid(self):
+        self.assertTrue(core.valid_gid("SLUS_209.46"))
+        for bad in ("", "SLUS_209.46/..", "../SLUS_209.46", "slus_209.46"):
+            self.assertFalse(core.valid_gid(bad))
+        self.assertEqual(core.download_art("/nonexistent", "../../x"), [])
+
+    def test_malformed_iso_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "malo.iso")
+            data = bytearray(2048 * 20)
+            pvd = 16 * 2048
+            data[pvd + 1:pvd + 6] = b"CD001"
+            root = pvd + 156
+            data[root + 2:root + 6] = (17).to_bytes(4, "little")
+            data[root + 10:root + 14] = (2048).to_bytes(4, "little")
+            for i in range(0, 2040, 255):         # registros encadenados hasta el final del sector...
+                data[17 * 2048 + i] = 255
+            data[17 * 2048 + 2040] = 200          # ...y uno que se sale de los datos leídos
+            with open(p, "wb") as f:
+                f.write(data)
+            self.assertEqual(core._read_boot_line(p), "")
+
+    def test_inbox_art_symlink_not_copied(self):
+        with tempfile.TemporaryDirectory() as d:
+            secret = os.path.join(d, "secreto.png")
+            with open(secret, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\nprivado")
+            link = os.path.join(d, "link.png")
+            os.symlink(secret, link)
+            self.assertFalse(core._is_plain_png(link))
+            self.assertTrue(core._is_plain_png(secret))
+
+
 if __name__ == "__main__":
     unittest.main()
