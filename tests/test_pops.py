@@ -151,6 +151,14 @@ class TestRejects(unittest.TestCase):
 
 
 class TestImportPS1(unittest.TestCase):
+    def setUp(self):                     # no usar la copia local real de POPSTARTER.ELF / POPS_IOX.PAK
+        self._store = tempfile.TemporaryDirectory()
+        self._old_store, core.POPS_STORE = core.POPS_STORE, self._store.name
+
+    def tearDown(self):
+        core.POPS_STORE = self._old_store
+        self._store.cleanup()
+
     def _inbox(self, root):
         game = os.path.join(root, "inbox", "Crash Bandicoot (USA)")
         os.makedirs(game)
@@ -312,6 +320,83 @@ class TestPopsApps(unittest.TestCase):
         core.rename_to(g, "SCUS_944.26.Crash Bandicoot.VCD")
         self.assertTrue(os.path.isfile(os.path.join(art, "XX.SCUS_944.26.Crash Bandicoot.ELF_COV.png")))
         self.assertFalse(os.path.exists(os.path.join(art, "XX.SCUS_944.26.Crash.ELF_COV.png")))
+
+    def test_smb_prefix_and_switch(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/Castlevania_Symphony_of_the_Night.VCD")
+        self._put("ART/XX.Castlevania_Symphony_of_the_Night.ELF_COV.png", b"png")
+        d = core.make_pops_app(self.lib, vcd)                       # USB (como el ejemplo hecho a mano)
+        g = core.Game(vcd, "POPS", "SLUS_000.67", "x", 1, self.lib)
+        self.assertEqual(core.missing_pops_apps([g], "SB"), [g])     # para SMB hay que cambiarlo
+        self.assertEqual(core.make_pops_app(self.lib, vcd, "SB"), d)
+        self.assertEqual(os.listdir(d).count("SB.Castlevania_Symphony_of_the_Night.ELF"), 1)
+        self.assertNotIn("XX.Castlevania_Symphony_of_the_Night.ELF", os.listdir(d))
+        with open(os.path.join(d, "title.cfg"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "title=Castlevania Symphony of the Night\n"
+                                       "boot=SB.Castlevania_Symphony_of_the_Night.ELF\n")
+        art = os.path.join(self.lib, "ART")
+        self.assertEqual(os.listdir(art), ["SB.Castlevania_Symphony_of_the_Night.ELF_COV.png"])
+        self.assertEqual(core.missing_pops_apps([g], "SB"), [])
+        self.assertEqual(core.make_pops_app(self.lib, vcd, "SB"), "")
+        issues = core.diagnose_library(self.lib, [g], prefix="XX")
+        self.assertIn("Su acceso es para red (SMB)", [i.title for i in issues])
+        with self.assertRaises(ValueError):
+            core.make_pops_app(self.lib, vcd, "../")
+
+    def test_switch_keeps_custom_title(self):
+        self._put("POPS/POPSTARTER.ELF", self.ELF)
+        vcd = self._put("POPS/Spyro.VCD")
+        d = core.make_pops_app(self.lib, vcd)
+        with open(os.path.join(d, "title.cfg"), "w", encoding="utf-8") as f:
+            f.write("title=Spyro the Dragon (mío)\nboot=XX.Spyro.ELF\n")
+        core.make_pops_app(self.lib, vcd, "SB")
+        with open(os.path.join(d, "title.cfg"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "title=Spyro the Dragon (mío)\nboot=SB.Spyro.ELF\n")
+
+    def test_prefix_from_config(self):
+        self.assertEqual(core.pops_prefix({}), "XX")
+        self.assertEqual(core.pops_prefix({"pops_device": "smb"}), "SB")
+        self.assertEqual(core.pops_prefix({"pops_device": "raro"}), "XX")
+
+    def test_smb_network_files(self):
+        self.assertEqual(core.smb_config_text("192.168.0.20", 445, "PS2SMB"), "192.168.0.20:445 PS2SMB\r\n\r\n\r\n")
+        self.assertEqual(core.smb_config_text("192.168.0.20", "139", "/PS2SMB/", "camilo", "clave"),
+                         "192.168.0.20:139 PS2SMB\r\ncamilo\r\nclave\r\n")
+        self.assertEqual(core.ip_config_text("192.168.0.10", "255.255.255.0", "192.168.0.1"),
+                         "192.168.0.10 255.255.255.0 192.168.0.1\r\n")
+        self.assertEqual(core.smb_config_text("192.168.0.254", "", "My Shared Folder"),     # ejemplo oficial
+                         "192.168.0.254:445 My Shared Folder\r\n\r\n\r\n")
+        for bad in (("300.1.1.1", 445, "S"), ("192.168.0.2", 445, "a/b"), ("192.168.0.2", 0, "S"),
+                    ("192.168.0.2", 445, "")):
+            with self.assertRaises(ValueError):
+                core.smb_config_text(*bad)
+        with self.assertRaises(ValueError):
+            core.smb_config_text("192.168.0.2", 445, "S", "user\nmal")
+        self.assertTrue(core.same_subnet("192.168.0.10", "192.168.0.20", "255.255.255.0"))
+        self.assertFalse(core.same_subnet("192.168.2.10", "192.168.0.20", "255.255.255.0"))
+        out = core.write_popstarter_net(self.tmp.name, "a\r\n", "b\r\n")
+        self.assertEqual(out, os.path.join(self.tmp.name, "POPSTARTER"))
+        core.write_popstarter_net(out, "c\r\n", "d\r\n")              # ya era la carpeta POPSTARTER
+        with open(os.path.join(out, "SMBCONFIG.DAT"), "rb") as f:
+            self.assertEqual(f.read(), b"c\r\n")
+        self.assertIn("SMBCONFIG.DAT.bak", os.listdir(out))             # el anterior no se pierde
+        with self.assertRaises(ValueError):
+            core.write_popstarter_net(self.tmp.name, "contraseña con ñ\r\n", "x")
+
+    def test_smb_checks(self):
+        os.makedirs(os.path.join(self.lib, "POPSTARTER"))
+        self.assertEqual(len(core.popstarter_net_missing(os.path.join(self.lib, "POPSTARTER"))), 6)
+        self._put("POPSTARTER/SMBMAN.IRX")
+        self.assertNotIn("smbman.irx", core.popstarter_net_missing(os.path.join(self.lib, "POPSTARTER")))
+        self._put("POPS/POPS_IOX.PAK", self.PAK)                      # no es el de red
+        vcd = self._put("POPS/Crash.vcd")
+        g = core.Game(vcd, "POPS", "", "Crash", 1, self.lib)
+        titles = {i.title: i for i in core.diagnose_library(self.lib, [g], prefix="SB")}
+        self.assertIn("POPS_IOX.PAK no sirve para red (SMB)", titles)
+        self.assertEqual(titles["La extensión tiene que ser .VCD en mayúsculas"].fix, "upper_vcd")
+        self.assertNotIn("POPS_IOX.PAK no sirve para red (SMB)",
+                         {i.title for i in core.diagnose_library(self.lib, [g], prefix="XX")})
+
 
 if __name__ == "__main__":
     unittest.main()

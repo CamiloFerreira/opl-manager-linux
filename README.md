@@ -37,6 +37,11 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
   `Tekken_5 [SLUS-21059].iso`…) y los renombra todos de una vez a `CÓDIGO.Nombre.iso`, mostrando antes cómo quedará
   cada uno. Nunca pisa otro archivo, en PS1 renombra también la carpeta de partidas guardadas, y el filtro
   «Nombre sin formato» los muestra en la biblioteca.
+- **Comprobar juegos**: busca lo que suele dejar la pantalla en negro en OPL: imágenes incompletas (descargas
+  cortadas o «rips»), archivos que no son una imagen de disco, juegos de CD en `DVD/` (y al revés), juegos de PS1
+  en `DVD/`/`CD/`, `.bin`/`.cue` que OPL no lee, código del nombre distinto al del disco, `.VCD` dañados y falta de
+  `POPSTARTER.ELF`/`POPS_IOX.PAK`. Con «Comprobar fragmentación» mira si las imágenes están partidas en trozos
+  (en exFAT/FAT32 pide la contraseña: usa `filefrag`, que solo lee). Algunos problemas se arreglan desde ahí mismo.
 - **Duplicados**: detecta ISOs con el mismo código y te deja elegir cuál conservar; las demás van a la papelera.
 - **Clic derecho en un juego**: ver detalles, cambiar nombre, descargar arte, cambiar portada, abrir carpeta,
   copiar el nombre del archivo o moverlo a la papelera (opcionalmente con su arte).
@@ -44,7 +49,7 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 **Bandeja de entrada** (tus carpetas de ROMs: descargas, colección en el equipo…):
 - Lee el código de cada juego directamente del disco (`SYSTEM.CNF`) y distingue PS2 de PS1.
 - Marca los que ya tienes en la biblioteca y los que todavía se están extrayendo.
-- Copia los juegos de PS2 a `DVD/` con nombre OPL (`SLUS_209.46.Nombre.iso`, opcionalmente corto para OPL viejo).
+- Copia los juegos de PS2 a `DVD/` (los de CD, a `CD/`) con nombre OPL (`SLUS_209.46.Nombre.iso`, opcionalmente corto para OPL viejo).
   También lleva la portada local y descarga el arte.
 - **Juegos de PS1 → POPS**: convierte los `.bin`/`.cue` a `POPS/SCUS_949.00.Nombre.VCD` (formato de cue2pops),
   sin archivos intermedios. Acepta dumps de un solo `.bin`, dumps Redump con una pista por archivo y cues de CDRWIN
@@ -54,6 +59,13 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
   (`title=` y `boot=`). El arte del juego se copia como `ART/XX.<nombre>.ELF_COV.png`, `_BG`, etc., porque OPL busca
   el arte de las apps por el nombre del ELF. Al renombrar o borrar el juego, el acceso y su arte lo acompañan.
   Para los `.VCD` que ya estaban, el botón «Mostrar PS1 en OPL» los crea.
+- **USB o red (SMB)**: en Ajustes se elige de dónde carga POPStarter los juegos. USB usa `XX.<nombre>.ELF`; SMB usa
+  `SB.<nombre>.ELF` (con `XX.` sobre SMB sale «no disk» porque busca un USB). Al cambiarlo, «Mostrar PS1 en OPL»
+  convierte los accesos existentes (ELF, `title.cfg` y arte). Para SMB, la memory card necesita además el paquete de
+  red de POPStarter en `mc0:/POPSTARTER/` (`SMBCONFIG.DAT`, `IPCONFIG.DAT` y módulos IRX), y el servidor SMBv1.
+  En Ajustes → «Archivos de red de POPStarter» se cargan la IP, el puerto, la carpeta compartida y el usuario del
+  servidor (esté donde esté) y la red de la PS2, y la app crea `POPSTARTER/SMBCONFIG.DAT` e `IPCONFIG.DAT` listos para
+  copiar a la memory card con wLaunchELF (la contraseña no se guarda en el equipo).
 - **`POPSTARTER.ELF` y `POPS/POPS_IOX.PAK`** no vienen con la app (`POPS_IOX.PAK` es de Sony). La primera vez que
   aparecen en un pendrive se guarda una copia en `~/.local/share/opl-manager/pops/` (o se eligen en Ajustes) y se
   copian solos a las unidades donde falten. Nunca se reemplazan los que ya están.

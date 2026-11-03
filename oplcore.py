@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import pops
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
@@ -69,6 +69,7 @@ DEFAULT_CONFIG = {
     "library": "",              # vacío: al abrir se busca sola la unidad con OPL
     "ps1_mode": "vcd",          # PS1: "vcd" = convertir a POPS/*.VCD · "copy" = copiar los .bin/.cue a ps1_dir
     "pops_apps": True,          # PS1: crear APPS/<juego>/XX.<juego>.ELF + title.cfg para verlos en OPL
+    "pops_device": "usb",       # de dónde carga POPStarter los .VCD: "usb" (XX.) o "smb" (SB.)
     "ps1_dir": "CD",            # carpeta de la biblioteca donde van los .bin/.cue de PS1 (modo "copy")
     "max_name": 32,             # 0 = sin límite (OPL nuevo)
     "download_art": True,
@@ -174,13 +175,13 @@ def _read_boot_line(path):
                     if name == b"SYSTEM.CNF":
                         elba = int.from_bytes(data[i + 2:i + 6], "little")
                         txt = sec(elba, size, off).decode("latin-1")
-                        m = re.search(r"BOOT2? *= *cdrom0?:[^\r\n;]*", txt)
+                        m = re.search(r"BOOT2?[ \t]*=[ \t]*cdrom0?:[^\r\n;]*", txt)
                         if m:
                             return m.group(0)
                     i += n
                 break
             f.seek(base)
-            m = re.search(rb"BOOT2? *= *cdrom0?:[^\r\n;]{0,40}", f.read(8_000_000))
+            m = re.search(rb"BOOT2?[ \t]*=[ \t]*cdrom0?:[^\r\n;]{0,40}", f.read(8_000_000))
             return m.group(0).decode("latin-1") if m else ""
         except (OSError, ValueError, IndexError, OverflowError):
             return ""
@@ -199,6 +200,7 @@ def disc_info(path):
             (hit[1] == "" or valid_gid(hit[1])):
         return hit[0], hit[1]
     line = _read_boot_line(path)
+    line = re.sub(r"[ \t]+", " ", line)
     console = "PS2" if line.startswith("BOOT2") else ("PS1" if line.startswith("BOOT") else "")
     m = ID_RE.search(line)
     gid = f"{m[1]}_{m[2]}.{m[3]}" if m else ""
@@ -907,7 +909,7 @@ def import_item(item, cfg, progress=None):
     if action == "vcd" and cfg.get("pops_apps", True):
         try:
             ensure_pops_files(lib)
-            make_pops_app(lib, target)
+            make_pops_app(lib, target, pops_prefix(cfg))
             link_pops_app_art(Game(target, "POPS", item.gid if valid_gid(item.gid) else "", "", 0, lib))
         except (OSError, ValueError) as e:
             item.extra["pops_app_error"] = str(e)
@@ -972,7 +974,8 @@ def item_destination(item, cfg):
     varios archivos con su nombre original."""
     max_len = int(cfg.get("max_name", 32) or 0)
     if item.console == "PS2" and not item.multi:
-        return "copy", "DVD", opl_filename(item.gid, item.title, ext_of(item.main), max_len)
+        folder = "CD" if item.size < CD_MAX_BYTES else "DVD"      # los juegos de CD van en CD/
+        return "copy", folder, opl_filename(item.gid, item.title, ext_of(item.main), max_len)
     if item.console == "PS1" and cfg.get("ps1_mode", "vcd") == "vcd" and item.extra.get("vcd_ok"):
         return "vcd", "POPS", opl_filename(item.gid, item.title, "VCD", max_len)
     if item.multi:
@@ -1073,22 +1076,46 @@ def ensure_pops_files(library):
     return copied, missing
 
 
+# Prefijo del ELF según de dónde carga POPStarter el .VCD: XX. = USB (mass:/POPS/), SB. = red SMB
+# (<carpeta compartida>/POPS/, con SMBCONFIG.DAT, IPCONFIG.DAT y los módulos de red en mc0:/POPSTARTER/).
+POPS_PREFIXES = {"usb": "XX", "smb": "SB"}
+
+
+def pops_prefix(cfg):
+    return POPS_PREFIXES.get(cfg.get("pops_device", "usb"), "XX")
+
+
 def pops_app_dir(library, vcd_path):
     return os.path.join(library, "APPS", os.path.splitext(os.path.basename(vcd_path))[0])
 
 
-def _pops_app_files(stem):
-    return f"XX.{stem}.ELF", "title.cfg"
+def _stem(vcd_path):
+    return os.path.splitext(os.path.basename(vcd_path))[0]
+
+
+def _elf_name(stem, prefix):
+    return f"{prefix}.{stem}.ELF"
 
 
 def _app_title(stem):
     return clean_title(strip_id(stem)) or stem
 
 
-def has_pops_app(library, vcd_path):
-    d = pops_app_dir(library, vcd_path)
-    elf, cfg = _pops_app_files(os.path.basename(d))
-    return bool(_find_ci(d, elf)) and bool(_find_ci(d, cfg))
+def _app_elf(library, vcd_path):
+    """(ruta del ELF del acceso, prefijo) si ya existe con cualquiera de los prefijos, o ('', '')."""
+    d, stem = pops_app_dir(library, vcd_path), _stem(vcd_path)
+    for prefix in POPS_PREFIXES.values():
+        p = _find_ci(d, _elf_name(stem, prefix))
+        if p:
+            return p, prefix
+    return "", ""
+
+
+def has_pops_app(library, vcd_path, prefix=None):
+    """¿Tiene acceso en APPS/? Con prefix, además tiene que ser de ese tipo (USB o SMB)."""
+    elf, have = _app_elf(library, vcd_path)
+    return bool(elf) and bool(_find_ci(pops_app_dir(library, vcd_path), "title.cfg")) and \
+        (prefix is None or have == prefix)
 
 
 def _write_title_cfg(path, title, boot):
@@ -1097,40 +1124,78 @@ def _write_title_cfg(path, title, boot):
         f.write(f"title={title}\nboot={boot}\n")
 
 
-def make_pops_app(library, vcd_path):
+def _retitle_cfg(d, stem, boot):
+    """Actualiza boot= en title.cfg conservando el título que tenga."""
+    cfg = _find_ci(d, "title.cfg")
+    if not cfg:
+        _write_title_cfg(os.path.join(d, "title.cfg"), _app_title(stem), boot)
+        return
+    title = _app_title(stem)
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            m = re.search(r"^title=(.*)$", f.read(), re.M)
+        if m and m[1].strip():
+            title = m[1].strip()
+    except OSError:
+        pass
+    _write_title_cfg(cfg, title, boot)
+
+
+def set_pops_app_prefix(library, vcd_path, prefix):
+    """Cambia un acceso existente entre USB (XX.) y SMB (SB.): ELF, title.cfg y arte. Devuelve True si cambió."""
+    elf, have = _app_elf(library, vcd_path)
+    if not elf or have == prefix:
+        return False
+    d, stem = pops_app_dir(library, vcd_path), _stem(vcd_path)
+    new_elf = _elf_name(stem, prefix)
+    _move(elf, os.path.join(d, new_elf))
+    _retitle_cfg(d, stem, new_elf)
+    for t in ART_TYPES:
+        old_art = os.path.join(library, "ART", pops_app_art_name(vcd_path, t, have))
+        new_art = os.path.join(library, "ART", pops_app_art_name(vcd_path, t, prefix))
+        if os.path.isfile(old_art) and not os.path.exists(new_art):
+            _move(old_art, new_art)
+    return True
+
+
+def make_pops_app(library, vcd_path, prefix="XX"):
     """Acceso para que OPL muestre el juego de PS1 en Aplicaciones:
-    APPS/<nombre>/XX.<nombre>.ELF (copia de POPSTARTER.ELF) y APPS/<nombre>/title.cfg.
-    POPStarter busca POPS/<nombre>.VCD a partir del nombre del ELF. No pisa nada que ya exista.
-    Devuelve la carpeta creada, o '' si ya estaba."""
-    if has_pops_app(library, vcd_path):
+    APPS/<nombre>/<prefijo>.<nombre>.ELF (copia de POPSTARTER.ELF) y APPS/<nombre>/title.cfg.
+    POPStarter busca POPS/<nombre>.VCD a partir del nombre del ELF (XX. en USB, SB. en SMB).
+    Si ya existe con el otro prefijo, lo cambia. No pisa nada. Devuelve la carpeta, o '' si ya estaba."""
+    if prefix not in POPS_PREFIXES.values():
+        raise ValueError(f"Prefijo no válido: {prefix!r}")
+    if has_pops_app(library, vcd_path, prefix):
         return ""
-    stem = os.path.splitext(os.path.basename(vcd_path))[0]
+    stem = _stem(vcd_path)
     if not stem or stem.startswith(".") or os.sep in stem:
         raise ValueError(f"Nombre de juego no válido: {stem!r}")
+    d = pops_app_dir(library, vcd_path)
+    if set_pops_app_prefix(library, vcd_path, prefix):
+        return d
     elf_src = _find_ci(os.path.join(library, "POPS"), "POPSTARTER.ELF")
     if not (elf_src and _valid_pops_file("POPSTARTER.ELF", elf_src)):
         elf_src = pops_store_file("POPSTARTER.ELF")
     if not elf_src:
         raise FileNotFoundError("Falta POPSTARTER.ELF (agrégalo en Ajustes)")
-    d = pops_app_dir(library, vcd_path)
     os.makedirs(d, exist_ok=True)
-    elf, cfg = _pops_app_files(stem)
+    elf = _elf_name(stem, prefix)
     if not _find_ci(d, elf):
         _copy_atomic(elf_src, os.path.join(d, elf))
-    if not _find_ci(d, cfg):
-        _write_title_cfg(os.path.join(d, cfg), _app_title(stem), elf)
+    if not _find_ci(d, "title.cfg"):
+        _write_title_cfg(os.path.join(d, "title.cfg"), _app_title(stem), elf)
     return d
 
 
-def pops_app_art_name(vcd_path, t):
+def pops_app_art_name(vcd_path, t, prefix="XX"):
     """OPL busca el arte de una app por el nombre de su ELF: ART/XX.<nombre>.ELF_COV.png"""
-    stem = os.path.splitext(os.path.basename(vcd_path))[0]
-    return f"{_pops_app_files(stem)[0]}_{t}.png"
+    return f"{_elf_name(_stem(vcd_path), prefix)}_{t}.png"
 
 
 def pops_app_art_files(library, vcd_path):
     art = os.path.join(library, "ART")
-    return [p for t in ART_TYPES if os.path.isfile(p := os.path.join(art, pops_app_art_name(vcd_path, t)))]
+    return [p for prefix in POPS_PREFIXES.values() for t in ART_TYPES
+            if os.path.isfile(p := os.path.join(art, pops_app_art_name(vcd_path, t, prefix)))]
 
 
 def link_pops_app_art(game):
@@ -1138,10 +1203,11 @@ def link_pops_app_art(game):
     Copia y no enlace: exFAT/FAT32 no tienen enlaces simbólicos. Nunca pisa nada. Devuelve cuántas copió."""
     if game.kind != "POPS" or not game.gid or not has_pops_app(game.library, game.path):
         return 0
+    prefix = _app_elf(game.library, game.path)[1]
     n = 0
     for t in ART_TYPES:
         src = game.art(t)
-        dst = os.path.join(game.library, "ART", pops_app_art_name(game.path, t))
+        dst = os.path.join(game.library, "ART", pops_app_art_name(game.path, t, prefix))
         if src and not os.path.exists(dst) and _is_plain_png(src):
             _copy_atomic(src, dst)
             n += 1
@@ -1158,8 +1224,9 @@ def sync_pops_app_art(games):
     return n
 
 
-def missing_pops_apps(games):
-    return [g for g in games if g.kind == "POPS" and not has_pops_app(g.library, g.path)]
+def missing_pops_apps(games, prefix=None):
+    """Juegos de PS1 sin acceso, o (con prefix) con el acceso del otro tipo (USB/SMB)."""
+    return [g for g in games if g.kind == "POPS" and not has_pops_app(g.library, g.path, prefix)]
 
 
 def _rename_pops_app(library, old_vcd, new_vcd):
@@ -1167,19 +1234,19 @@ def _rename_pops_app(library, old_vcd, new_vcd):
     old_d, new_d = pops_app_dir(library, old_vcd), pops_app_dir(library, new_vcd)
     if not os.path.isdir(old_d) or os.path.islink(old_d):
         return
-    old_stem, new_stem = os.path.basename(old_d), os.path.basename(new_d)
-    old_elf = _find_ci(old_d, _pops_app_files(old_stem)[0])
+    old_elf, prefix = _app_elf(library, old_vcd)
     if not old_elf:
         return          # carpeta que no es nuestra: no se toca
+    new_stem = _stem(new_vcd)
     _move(old_d, new_d)
-    new_elf = _pops_app_files(new_stem)[0]
+    new_elf = _elf_name(new_stem, prefix)
     _move(os.path.join(new_d, os.path.basename(old_elf)), os.path.join(new_d, new_elf))
     cfg = _find_ci(new_d, "title.cfg")
     if cfg:
         _write_title_cfg(cfg, _app_title(new_stem), new_elf)
     for t in ART_TYPES:                   # el arte de la app va por el nombre del ELF
-        old_art = os.path.join(library, "ART", pops_app_art_name(old_vcd, t))
-        new_art = os.path.join(library, "ART", pops_app_art_name(new_vcd, t))
+        old_art = os.path.join(library, "ART", pops_app_art_name(old_vcd, t, prefix))
+        new_art = os.path.join(library, "ART", pops_app_art_name(new_vcd, t, prefix))
         if os.path.isfile(old_art) and not os.path.exists(new_art):
             _move(old_art, new_art)
 
@@ -1191,3 +1258,316 @@ def pops_ready(library):
         return any(n.upper() == "POPS_IOX.PAK" for n in os.listdir(d))
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------- diagnóstico: juegos que pueden quedar en negro
+CD_MAX_BYTES = 700 * 1024 * 1024       # más chico que esto: juego de CD (va en CD/, no en DVD/)
+CD_LIMIT_BYTES = 900 * 1024 * 1024     # más grande que esto no entra en un CD: va en DVD/
+OPL_READS = {"DVD": {"iso"}, "CD": {"iso"}, "POPS": {"vcd"}}
+
+
+@dataclass
+class Issue:
+    level: str          # 'error' (casi seguro falla) | 'warn' (puede fallar) | 'info'
+    title: str
+    detail: str
+    game: object = None
+    path: str = ""
+    fix: str = ""       # '' | 'move_cd' | 'move_dvd' | 'trash'
+
+
+def _disc_blocks(path):
+    """(bloques que dice el disco, bloques que hay en el archivo) leyendo el ISO9660, o None."""
+    base = pops.HEADER if ext_of(path) == "vcd" else 0
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            for sec, off in ((2048, 0), (2352, 24), (2352, 16)):
+                f.seek(base + 16 * sec + off)
+                pvd = f.read(2048)
+                if pvd[1:6] == b"CD001":
+                    vol = int.from_bytes(pvd[80:84], "little")
+                    return vol, max(size - base, 0) // sec
+    except OSError:
+        pass
+    return None
+
+
+def diagnose_game(g):
+    issues = []
+    add = lambda level, title, detail, fix="": issues.append(Issue(level, title, detail, g, g.path, fix))  # noqa: E731
+    blocks = _disc_blocks(g.path)
+    if g.kind == "POPS":
+        rest = g.size - pops.HEADER
+        if rest <= 0 or rest % pops.SECTOR:
+            add("error", "VCD dañado", "El tamaño no corresponde a un .VCD de POPS (cabecera de 1 MiB + sectores de "
+                "2352 bytes). Vuelve a convertirlo desde el .bin/.cue.", "trash")
+            return issues
+    if blocks is None:
+        add("error", "No es una imagen de disco válida",
+            "No se encontró el sistema de archivos del disco (ISO9660). Probablemente está dañada o es otro formato.",
+            "trash")
+        return issues
+    vol, have = blocks
+    if have < vol:
+        falta = (vol - have) * (2048 if g.kind != "POPS" else pops.SECTOR)
+        add("error", "Imagen incompleta",
+            f"El disco dice que mide {human_size(vol * 2048)} pero al archivo le faltan {human_size(falta)}: "
+            "descarga cortada o versión recortada («rip»). Cuando el juego lee esa parte se queda en negro. "
+            "Bájalo de nuevo.", "trash")
+    console, disc_gid = disc_info(g.path)
+    if g.kind == "POPS" and console == "PS2":
+        add("error", "Juego de PS2 en POPS/", "POPS solo abre juegos de PS1. Este va como .iso en DVD/ o CD/.")
+    elif g.kind != "POPS":
+        if console == "PS1":
+            add("error", "Juego de PS1 en " + g.kind + "/",
+                "OPL no abre juegos de PS1 desde DVD/ ni CD/. Conviértelo a .VCD desde la Bandeja de entrada.")
+        elif not console:
+            add("warn", "No se encontró SYSTEM.CNF",
+                "No se pudo leer qué arranca el disco: puede estar dañado o no ser un juego de PS2.")
+        disc_size = vol * 2048 or g.size          # el tamaño real del disco, aunque la imagen esté cortada
+        if g.kind == "DVD" and disc_size < CD_MAX_BYTES:
+            add("warn", "Juego de CD en DVD/",
+                f"El disco mide {human_size(disc_size)}: es un juego de CD. OPL le avisa al juego que lee un DVD y varios juegos "
+                "de CD se cuelgan así. Muévelo a CD/.", "move_cd")
+        elif g.kind == "CD" and disc_size > CD_LIMIT_BYTES:
+            add("warn", "Juego de DVD en CD/", f"El disco mide {human_size(disc_size)}: no entra en un CD. "
+                "Muévelo a DVD/.",
+                "move_dvd")
+    name_gid = id_from_name(g.filename)
+    if name_gid and disc_gid and name_gid != disc_gid:
+        add("warn", "El código del nombre no es el del disco",
+            f"El nombre dice {name_gid} pero el disco es {disc_gid}. OPL usa el código para la configuración, "
+            "las partidas (VMC) y el arte, así que pueden no corresponder.")
+    if g.kind != "POPS" and not name_gid and disc_gid:
+        add("info", "Nombre sin código", "OPL lo encuentra igual, pero con «Corregir nombres» queda "
+            f"como {disc_gid}.Nombre.iso.")
+    return issues
+
+
+def diagnose_library(library, games, progress=None, prefix=None):
+    """Problemas que hacen que un juego no arranque (pantalla negra) o no aparezca en OPL."""
+    issues = []
+    for i, g in enumerate(games):
+        if progress:
+            progress(i, len(games), g.filename)
+        issues += diagnose_game(g)
+    for folder, exts in OPL_READS.items():
+        d = os.path.join(library, folder)
+        try:
+            names = sorted(os.listdir(d), key=str.lower)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            e = ext_of(n)
+            if os.path.isfile(p) and e in ROM_EXT and e not in exts:
+                hint = ("Los juegos de PS1 van como .VCD en POPS/ (conviértelos desde la Bandeja de entrada)."
+                        if e in ("bin", "cue", "img", "ccd", "sub") else "OPL solo lee .iso en DVD/ y CD/.")
+                issues.append(Issue("warn", f"OPL no lee archivos .{e} en {folder}/", hint, None, p))
+    if any(g.kind == "POPS" for g in games):
+        d = os.path.join(library, "POPS")
+        for name in POPS_FILES:
+            if not _find_ci(d, name):
+                issues.append(Issue("error", f"Falta POPS/{name}",
+                                    "Sin este archivo no arranca ningún juego de PS1. Agrégalo en Ajustes.",
+                                    None, os.path.join(d, name)))
+        pak = _find_ci(d, "POPS_IOX.PAK")
+        if prefix == "SB" and pak:
+            try:
+                ok = _md5(pak) == POPS_IOX_SMB_MD5
+            except OSError:
+                ok = True
+            if not ok:
+                issues.append(Issue("error", "POPS_IOX.PAK no sirve para red (SMB)",
+                                    "Para SMB hace falta el POPS_IOX.PAK que trae los módulos de red (MD5 "
+                                    f"{POPS_IOX_SMB_MD5}). Con otro, los juegos de PS1 no arrancan por red.",
+                                    None, pak))
+        for g in games:
+            if g.kind == "POPS" and os.path.splitext(g.filename)[1] != ".VCD":
+                issues.append(Issue("error", "La extensión tiene que ser .VCD en mayúsculas",
+                                    "POPStarter solo encuentra el juego si termina en .VCD (en mayúsculas).",
+                                    g, g.path, "upper_vcd"))
+        fs = fs_type(library)
+        if prefix == "XX" and fs and fs not in ("vfat", "msdos", "fat"):
+            issues.append(Issue("warn", f"POPStarter por USB y la unidad es {fs}",
+                                "Según la comunidad, POPStarter por USB solo lee pendrives FAT32 (OPL sí lee exFAT). "
+                                "Si los juegos de PS1 no arrancan por USB, usa un pendrive FAT32 para POPS/ o cárgalos "
+                                "por red (SMB).", None, os.path.join(library, "POPS")))
+        for g in missing_pops_apps(games, prefix):
+            other = _app_elf(library, g.path)[1]
+            if other:
+                where = "USB" if other == "XX" else "red (SMB)"
+                issues.append(Issue("error", f"Su acceso es para {where}",
+                                    f"El ELF empieza con {other}. y POPStarter va a buscar el juego en {where}, "
+                                    "no donde lo tienes configurado en Ajustes (sale «no disk»). Usa «Mostrar PS1 en "
+                                    "OPL» para cambiarlo.", g, g.path))
+            else:
+                issues.append(Issue("info", "No aparece en Aplicaciones de OPL",
+                                    "Falta su acceso en APPS/. Usa «Mostrar PS1 en OPL».", g, g.path))
+    order = {"error": 0, "warn": 1, "info": 2}
+    issues.sort(key=lambda x: (order[x.level], os.path.basename(x.path).lower()))
+    return issues
+
+
+def move_game(game, folder):
+    """Mueve el juego a otra carpeta de la biblioteca (DVD/ o CD/), con el mismo nombre. No pisa nada."""
+    if folder not in ("DVD", "CD"):
+        raise ValueError(folder)
+    d = os.path.join(game.library, folder)
+    os.makedirs(d, exist_ok=True)
+    dst = os.path.join(d, game.filename)
+    if os.path.exists(dst):
+        raise FileExistsError(f"Ya existe {folder}/{game.filename}")
+    os.rename(game.path, dst)
+    return dst
+
+
+# Fragmentación: OPL lee la imagen directo del USB; un archivo partido en muchos trozos puede quedar en negro
+# o trabarse. En exFAT/FAT el kernel solo lo informa con permisos de administrador (FIBMAP).
+FRAG_WARN = 2
+
+
+class NeedsRoot(Exception):
+    pass
+
+
+def fragmentation(paths, as_root=False):
+    """{ruta: cantidad de trozos} usando filefrag. Con as_root se usa pkexec (pide la contraseña una vez)."""
+    import subprocess  # nosec B404 - se ejecuta filefrag con argumentos fijos, sin shell
+    tool = shutil.which("filefrag") or "/usr/sbin/filefrag"
+    if not os.path.exists(tool):
+        raise FileNotFoundError("No está filefrag (paquete e2fsprogs)")
+    paths = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
+    if not paths:
+        return {}
+    cmd = [tool] + paths
+    if as_root:
+        pk = shutil.which("pkexec")
+        if not pk:
+            raise FileNotFoundError("No está pkexec para pedir permisos de administrador")
+        cmd = [pk] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # nosec B603
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^(.*): (\d+) extents? found", line)
+        if m and m[1] in paths:
+            out[m[1]] = int(m[2])
+    if not out and ("FIBMAP" in (r.stderr or "") or "root" in (r.stderr or "") or "Operation not permitted" in (r.stderr or "")):
+        raise NeedsRoot()
+    if as_root and r.returncode in (126, 127) and not out:
+        raise PermissionError("No se dieron los permisos de administrador")
+    return out
+
+
+def fragmentation_issues(games, frags):
+    issues = []
+    by_path = {g.path: g for g in games}
+    for p, n in sorted(frags.items(), key=lambda kv: -kv[1]):
+        if n >= FRAG_WARN and p in by_path:
+            issues.append(Issue("warn", f"Archivo fragmentado ({n} trozos)",
+                                "OPL lee mejor los juegos guardados en un solo trozo. Para arreglarlo: cópialo a la PC, "
+                                "bórralo del pendrive y vuelve a copiarlo (o desfragmenta la unidad).",
+                                by_path[p], p))
+    return issues
+
+
+# ---------------------------------------------------------------- POPStarter por red (SMB): archivos de la memory card
+# POPStarter en modo SMB lee la red de mc0:/POPSTARTER/ (con los módulos que trae POPSTARTER.zip):
+#   SMBCONFIG.DAT: "IP:PUERTO CARPETA" / usuario / contraseña (las dos últimas vacías = invitado)
+#   IPCONFIG.DAT:  "IP-DE-LA-PS2 MÁSCARA PUERTA-DE-ENLACE"
+# Se escriben con CRLF, como los que se hacen con el Bloc de notas en los tutoriales.
+def _ipv4(value, what):
+    import ipaddress
+    try:
+        return str(ipaddress.IPv4Address(str(value).strip()))
+    except ValueError:
+        raise ValueError(f"{what} no es una dirección IPv4 válida: {value!r}") from None
+
+
+def smb_config_text(server, port, share, user="", password=""):
+    server = _ipv4(server, "La IP del servidor")
+    try:
+        port = 445 if port is None or str(port).strip() == "" else int(str(port).strip())
+    except ValueError:
+        raise ValueError(f"Puerto no válido: {port!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Puerto no válido: {port}")
+    share = str(share).strip().strip("\\/").strip()      # puede tener espacios: es el resto de la línea
+    if not share or re.search(r"[\\/\x00-\x1f]", share):
+        raise ValueError("La carpeta compartida no puede estar vacía ni tener barras")
+    for v, what in ((user, "usuario"), (password, "contraseña")):
+        if re.search(r"[\r\n\x00]", v or "") or (v or "").strip() != (v or ""):
+            raise ValueError(f"El {what} no puede tener saltos de línea ni espacios al principio o al final")
+    text = f"{server}:{port} {share}\r\n{user or ''}\r\n{password or ''}\r\n"
+    if not text.isascii():
+        raise ValueError("Usa solo letras sin acentos ni ñ: la PS2 no los entiende")
+    return text
+
+
+def ip_config_text(ps2_ip, netmask, gateway):
+    return f"{_ipv4(ps2_ip, 'La IP de la PS2')} {_ipv4(netmask, 'La máscara')} {_ipv4(gateway, 'La puerta de enlace')}\r\n"
+
+
+def same_subnet(a, b, netmask):
+    import ipaddress
+    try:
+        net = ipaddress.IPv4Network(f"{a}/{netmask}", strict=False)
+        return ipaddress.IPv4Address(b) in net
+    except ValueError:
+        return False
+
+
+# módulos de red que POPStarter carga de mc0:/POPSTARTER/ (o mc1:) en modo SMB
+POPS_NET_IRX = ("poweroff.irx", "ps2dev9.irx", "smsutils.irx", "ps2ip.irx", "ps2smap.irx", "smbman.irx")
+# POPS_IOX.PAK con los módulos de red incluidos: el único que sirve para SMB (documentación de POPStarter)
+POPS_IOX_SMB_MD5 = "a625d0b3036823cdbf04a3c0e1648901"
+
+
+def popstarter_net_missing(folder):
+    """Módulos .irx que faltan en la carpeta POPSTARTER (sin importar mayúsculas)."""
+    return [n for n in POPS_NET_IRX if not _find_ci(folder, n)]
+
+
+def _md5(path):
+    import hashlib
+    h = hashlib.md5(usedforsecurity=False)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_popstarter_net(folder, smb_text, ip_text):
+    """Escribe POPSTARTER/SMBCONFIG.DAT e IPCONFIG.DAT dentro de folder (p. ej. un pendrive para llevarlos a
+    la memory card). Si ya existían, quedan como .bak. Devuelve la carpeta POPSTARTER."""
+    files = []
+    for name, text in (("SMBCONFIG.DAT", smb_text), ("IPCONFIG.DAT", ip_text)):
+        try:
+            files.append((name, text.encode("ascii")))     # la PS2 no entiende acentos ni ñ
+        except UnicodeEncodeError:
+            raise ValueError(f"{name}: usa solo letras sin acentos ni ñ (la PS2 no los entiende)") from None
+    d = folder if os.path.basename(folder.rstrip("/")).upper() == "POPSTARTER" else os.path.join(folder, "POPSTARTER")
+    os.makedirs(d, exist_ok=True)
+    for name, data in files:
+        p = _find_ci(d, name) or os.path.join(d, name)
+        if os.path.exists(p):
+            os.replace(p, free_path(p + ".bak"))
+        with open(p, "wb") as f:
+            f.write(data)
+    return d
+
+
+def default_gateway():
+    """Puerta de enlace de este equipo (para sugerirla), o ''."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) > 2 and parts[1] == "00000000" and parts[2] != "00000000":
+                    import socket
+                    import struct
+                    return socket.inet_ntoa(struct.pack("<L", int(parts[2], 16)))
+    except (OSError, ValueError):
+        pass
+    return ""

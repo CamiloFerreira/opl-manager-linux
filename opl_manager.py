@@ -354,6 +354,11 @@ class LibraryPage(Gtk.Box):
         self.apps_btn.connect("clicked", self._make_pops_apps)
         bar.append(self.apps_btn)
         self.no_app = []
+        self.diag_btn = Gtk.Button(label="Comprobar juegos",
+                                   tooltip_text="Busca lo que hace que un juego quede en negro: imágenes incompletas, "
+                                                "juegos en la carpeta equivocada, fragmentación…")
+        self.diag_btn.connect("clicked", lambda *_: DiagnosticsDialog(self.win).present(self.win))
+        bar.append(self.diag_btn)
         self.art_btn = Gtk.Button(label="Descargar arte faltante", tooltip_text="Baja portadas, lomos, fondos y capturas que falten. No sobrescribe nada.")
         self.art_btn.connect("clicked", self._download_all_art)
         bar.append(self.art_btn)
@@ -433,7 +438,7 @@ class LibraryPage(Gtk.Box):
         self.fix_paths = {f.game.path for f in self.fixes}
         self.fix_btn.set_label(f"Corregir nombres ({len(self.fixes)})")
         self.fix_btn.set_visible(bool(self.fixes))
-        self.no_app = core.missing_pops_apps(games)
+        self.no_app = core.missing_pops_apps(games, core.pops_prefix(self.win.cfg))
         self.apps_btn.set_label(f"Mostrar PS1 en OPL ({len(self.no_app)})")
         self.apps_btn.set_visible(bool(self.no_app))
         self.empty.set_title("Sin juegos")
@@ -515,6 +520,7 @@ class LibraryPage(Gtk.Box):
     def _make_pops_apps(self, *_):
         todo = list(self.no_app)
         lib = self.win.cfg["library"]
+        prefix = core.pops_prefix(self.win.cfg)
         self.apps_btn.set_sensitive(False)
 
         def work():
@@ -522,7 +528,7 @@ class LibraryPage(Gtk.Box):
             done, errors = 0, []
             for g in todo:
                 try:
-                    if core.make_pops_app(lib, g.path):
+                    if core.make_pops_app(lib, g.path, prefix):
                         done += 1
                     core.link_pops_app_art(g)
                 except (OSError, ValueError) as e:
@@ -787,6 +793,294 @@ class NameFixDialog(Adw.Dialog):
         run_bg(lambda: core.apply_name_fixes(sel), finished, failed)
 
 
+# =============================================================== Diagnóstico
+class DiagnosticsDialog(Adw.Dialog):
+    """Comprueba los juegos de la biblioteca: lo que suele dejar la pantalla en negro en OPL."""
+    LEVELS = (("error", "Casi seguro fallan", "dialog-error-symbolic"),
+              ("warn", "Pueden fallar", "dialog-warning-symbolic"),
+              ("info", "Para mejorar", "dialog-information-symbolic"))
+
+    def __init__(self, win):
+        super().__init__(title="Comprobar juegos", content_width=760, content_height=680)
+        self.win = win
+        self.games = []
+        self.issues = []
+        self.frag_issues = []
+        self.frag_done = False
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        self.stack = Gtk.Stack()
+        self.loading = Adw.StatusPage(title="Revisando juegos…")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, halign=Gtk.Align.CENTER)
+        box.append(Gtk.Spinner(spinning=True, width_request=32, height_request=32, halign=Gtk.Align.CENTER))
+        self.load_lbl = Gtk.Label(wrap=True, max_width_chars=50)
+        self.load_lbl.add_css_class("dim-label")
+        box.append(self.load_lbl)
+        self.loading.set_child(box)
+        self.stack.add_named(self.loading, "loading")
+        self.sc = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.stack.add_named(self.sc, "list")
+        tv.set_content(self.stack)
+
+        bottom = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        self.frag_btn = Gtk.Button(label="Comprobar fragmentación",
+                                   tooltip_text="Mira si las imágenes están partidas en trozos. En exFAT/FAT32 "
+                                                "pide la contraseña de administrador (solo lee, no cambia nada).")
+        self.frag_btn.connect("clicked", lambda *_: self._check_frag(False))
+        bottom.append(self.frag_btn)
+        tv.add_bottom_bar(bottom)
+        self.set_child(tv)
+        self.run()
+
+    # ---- revisión
+    def run(self):
+        lib = self.win.cfg["library"]
+        if not os.path.isdir(lib):
+            self.loading.set_title("Biblioteca no conectada")
+            self.loading.get_child().set_visible(False)
+            self.frag_btn.set_sensitive(False)
+            return
+        self.stack.set_visible_child_name("loading")
+        self.frag_btn.set_sensitive(False)
+
+        def prog(i, n, name):
+            GLib.idle_add(self.load_lbl.set_text, f"{i + 1}/{n}  ·  {name}")
+
+        def work():
+            games = core.scan_library(lib)
+            return games, core.diagnose_library(lib, games, prog, core.pops_prefix(self.win.cfg))
+
+        def done(res):
+            self.games, self.issues = res
+            if self.frag_done:            # tras un arreglo, la fragmentación se vuelve a pedir
+                self.frag_issues, self.frag_done = [], False
+            self._show()
+
+        run_bg(work, done, lambda e: self.win.toast(f"Error al revisar: {e}"))
+
+    def _check_frag(self, as_root):
+        targets = [g.path for g in self.games]
+        if not targets:
+            return
+        self.frag_btn.set_sensitive(False)
+        self.frag_btn.set_label("Revisando fragmentación…")
+
+        def done(frags):
+            self.frag_btn.set_label("Comprobar fragmentación")
+            self.frag_issues = core.fragmentation_issues(self.games, frags)
+            self.frag_done = True
+            self._show()
+            self.win.toast(f"{len(self.frag_issues)} juego(s) fragmentados" if self.frag_issues
+                           else "Ningún juego está fragmentado")
+
+        def failed(e):
+            self.frag_btn.set_label("Comprobar fragmentación")
+            self.frag_btn.set_sensitive(True)
+            if isinstance(e, core.NeedsRoot) and not as_root:
+                ask = Adw.AlertDialog(heading="Hace falta la contraseña de administrador",
+                                      body="En pendrives exFAT/FAT32 Linux solo informa la fragmentación con "
+                                           "permisos de administrador. Se ejecuta «filefrag», que solo lee: no "
+                                           "cambia ningún archivo.")
+                ask.add_response("cancel", "Cancelar")
+                ask.add_response("ok", "Continuar")
+                ask.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+                ask.connect("response", lambda _d, r: r == "ok" and self._check_frag(True))
+                ask.present(self)
+            else:
+                self.win.toast(f"No se pudo revisar la fragmentación: {e}")
+        run_bg(lambda: core.fragmentation(targets, as_root), done, failed)
+
+    # ---- resultado
+    def _show(self):
+        issues = self.issues + self.frag_issues
+        self.frag_btn.set_sensitive(not self.frag_done)
+        page = Adw.PreferencesPage()
+        n_err = sum(i.level == "error" for i in issues)
+        n_warn = sum(i.level == "warn" for i in issues)
+        frag_note = "" if self.frag_done else " La fragmentación se revisa aparte con el botón de abajo."
+        if not issues:
+            status = Adw.StatusPage(icon_name="emblem-ok-symbolic", title="No se encontraron problemas",
+                                    description=f"Se revisaron {len(self.games)} juegos.{frag_note} Si un juego igual "
+                                                "queda en negro, prueba los modos de compatibilidad de OPL "
+                                                "(triángulo sobre el juego).")
+            self.sc.set_child(status)
+            self.stack.set_visible_child_name("list")
+            return
+        page.set_description(f"{len(self.games)} juegos revisados: {n_err} con problemas graves, {n_warn} que pueden "
+                             f"fallar.{frag_note} Lo que no se ve desde la PC (juegos que necesitan modos de "
+                             "compatibilidad de OPL, hacks o traducciones) no aparece aquí.")
+        for level, title, icon in self.LEVELS:
+            items = [i for i in issues if i.level == level]
+            if not items:
+                continue
+            grp = Adw.PreferencesGroup(title=f"{title} ({len(items)})")
+            for it in items:
+                name = os.path.basename(it.path) if it.path else ""
+                row = Adw.ExpanderRow(title=GLib.markup_escape_text(name or it.title),
+                                      subtitle=GLib.markup_escape_text(it.title if name else ""))
+                row.add_prefix(Gtk.Image(icon_name=icon))
+                detail = Gtk.Label(label=it.detail, wrap=True, xalign=0, margin_start=12, margin_end=12,
+                                   margin_top=8, margin_bottom=8, selectable=True)
+                row.add_row(detail)
+                btn = self._fix_button(it)
+                if btn:
+                    row.add_suffix(btn)
+                grp.add(row)
+            page.add(grp)
+        self.sc.set_child(page)
+        self.stack.set_visible_child_name("list")
+
+    def _fix_button(self, it):
+        g = it.game
+        if not g or not it.fix:
+            return None
+        label = {"move_cd": "Mover a CD/", "move_dvd": "Mover a DVD/", "trash": "A la papelera…",
+                 "upper_vcd": "Cambiar a .VCD"}[it.fix]
+        b = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+        if it.fix == "trash":
+            b.add_css_class("destructive-action")
+        b.connect("clicked", lambda *_: self._fix(it))
+        return b
+
+    def _fix(self, it):
+        g = it.game
+        if it.fix == "trash":
+            trash_game_dialog(self.win, g)
+            self.close()
+            return
+        if it.fix == "upper_vcd":
+            try:
+                new = core.rename_to(g, os.path.splitext(g.filename)[0] + ".VCD")
+            except (OSError, ValueError) as e:
+                self.win.toast(f"No se pudo renombrar: {e}")
+                return
+            self.win.toast(f"Renombrado a {os.path.basename(new)}")
+            self.win.library.reload()
+            self.run()
+            return
+        try:
+            core.move_game(g, "CD" if it.fix == "move_cd" else "DVD")
+        except (OSError, ValueError) as e:
+            self.win.toast(f"No se pudo mover: {e}")
+            return
+        self.win.toast(f"{g.filename} movido a {'CD' if it.fix == 'move_cd' else 'DVD'}/")
+        self.win.library.reload()
+        self.run()
+
+
+# =============================================================== POPStarter por red
+class PopsNetDialog(Adw.Dialog):
+    """Genera SMBCONFIG.DAT e IPCONFIG.DAT para mc0:/POPSTARTER/ (POPStarter por SMB)."""
+
+    def __init__(self, win):
+        super().__init__(title="POPStarter por red", content_width=560, content_height=720)
+        self.win = win
+        c = win.cfg.get("pops_net") or {}
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage(description=(
+            "POPStarter no usa la red de OPL: la lee de la memory card, en mc0:/POPSTARTER/. Esa carpeta viene "
+            "en POPSTARTER.zip (con sus módulos de red). Aquí se crean los dos archivos que hay que editar; "
+            "pon los mismos datos que en la configuración de red de OPL."))
+        g1 = Adw.PreferencesGroup(title="Servidor SMB (donde están los juegos)")
+        self.server = Adw.EntryRow(title="IP del servidor", text=c.get("server", ""))
+        self.port = Adw.EntryRow(title="Puerto (445; si no conecta, prueba 139)", text=str(c.get("port", 445)))
+        self.share = Adw.EntryRow(title="Nombre de la carpeta compartida", text=c.get("share", ""))
+        self.user = Adw.EntryRow(title="Usuario (vacío = invitado)", text=c.get("user", ""))
+        self.password = Adw.PasswordEntryRow(title="Contraseña (no se guarda en este equipo)")
+        for r in (self.server, self.port, self.share, self.user, self.password):
+            g1.add(r)
+        page.add(g1)
+        g2 = Adw.PreferencesGroup(title="PlayStation 2",
+                                  description="Tiene que estar en la misma red que el servidor.")
+        self.ps2 = Adw.EntryRow(title="IP de la PS2", text=c.get("ps2_ip", ""))
+        self.mask = Adw.EntryRow(title="Máscara", text=c.get("netmask", "255.255.255.0"))
+        self.gw = Adw.EntryRow(title="Puerta de enlace", text=c.get("gateway", "") or core.default_gateway())
+        for r in (self.ps2, self.mask, self.gw):
+            g2.add(r)
+        page.add(g2)
+        self.preview = Gtk.Label(xalign=0, selectable=True, wrap=True, margin_start=12, margin_end=12)
+        self.preview.add_css_class("monospace")
+        g3 = Adw.PreferencesGroup(title="Así quedan")
+        g3.add(self.preview)
+        page.add(g3)
+        for r in (self.server, self.port, self.share, self.user, self.ps2, self.mask, self.gw):
+            r.connect("changed", lambda *_: self._update())
+        tv.set_content(page)
+        bottom = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8,
+                         halign=Gtk.Align.END)
+        self.go = Gtk.Button(label="Guardar en una carpeta o pendrive…")
+        self.go.add_css_class("suggested-action")
+        self.go.connect("clicked", self._save)
+        bottom.append(self.go)
+        tv.add_bottom_bar(bottom)
+        self.set_child(tv)
+        self._update()
+
+    def _texts(self):
+        smb = core.smb_config_text(self.server.get_text(), self.port.get_text(),
+                                   self.share.get_text(), self.user.get_text(), self.password.get_text())
+        ip = core.ip_config_text(self.ps2.get_text(), self.mask.get_text(), self.gw.get_text())
+        return smb, ip
+
+    def _update(self):
+        try:
+            smb, ip = self._texts()
+        except ValueError as e:
+            empty = not all(r.get_text().strip() for r in (self.server, self.share, self.ps2, self.mask, self.gw))
+            self.preview.set_text("Completa la IP del servidor, la carpeta compartida y la red de la PS2."
+                                  if empty else str(e))
+            self.go.set_sensitive(False)
+            return
+        shown = smb.split("\r\n")
+        if len(shown) > 2 and shown[2]:
+            shown[2] = "•" * len(shown[2])
+        txt = "SMBCONFIG.DAT\n" + "\n".join(shown[:3]) + "\n\nIPCONFIG.DAT\n" + ip.strip()
+        if not core.same_subnet(self.ps2.get_text().strip(), self.server.get_text().strip(), self.mask.get_text().strip()):
+            txt += "\n\n⚠ La PS2 y el servidor están en redes distintas: POPStarter suele no conectar así."
+        self.preview.set_text(txt)
+        self.go.set_sensitive(True)
+
+    def _save(self, *_):
+        try:
+            smb, ip = self._texts()
+        except ValueError as e:
+            self.win.toast(str(e))
+            return
+        self.win.cfg["pops_net"] = {"server": self.server.get_text().strip(), "port": self.port.get_text().strip(),
+                                    "share": self.share.get_text().strip(), "user": self.user.get_text(),
+                                    "ps2_ip": self.ps2.get_text().strip(), "netmask": self.mask.get_text().strip(),
+                                    "gateway": self.gw.get_text().strip()}
+        core.save_config(self.win.cfg)
+        d = Gtk.FileDialog(title="¿Dónde guardar la carpeta POPSTARTER?")
+
+        def chosen(dialog, res):
+            try:
+                folder = dialog.select_folder_finish(res).get_path()
+            except GLib.Error:
+                return
+            try:
+                out = core.write_popstarter_net(folder, smb, ip)
+            except (OSError, ValueError) as e:
+                self.win.toast(f"No se pudo guardar: {e}")
+                return
+            missing = core.popstarter_net_missing(out)
+            step1 = ("1. Ya están los 6 módulos de red (.irx).\n" if not missing else
+                     "1. Faltan módulos de red en esa carpeta: " + ", ".join(missing) + ". Vienen en el paquete "
+                     "de red de POPStarter; cópialos ahí sin reemplazar los dos .DAT.\n")
+            al = Adw.AlertDialog(
+                heading="Archivos creados",
+                body=f"Quedaron en {tilde(out)}.\n\n" + step1 +
+                     "2. En la PS2, con wLaunchELF, copia esa carpeta POPSTARTER a mc0:/.\n"
+                     "3. En Ajustes elige «Red SMB (SB.)» y usa «Mostrar PS1 en OPL».\n"
+                     "4. En el servidor, los .VCD y POPS_IOX.PAK van en POPS/ de la carpeta compartida "
+                     "(el servidor tiene que aceptar SMBv1, igual que para OPL).")
+            al.add_response("ok", "Aceptar")
+            al.present(self)
+        d.select_folder(self.win, None, chosen)
+
+
 # =============================================================== Detalle de un juego
 class GameDialog(Adw.Dialog):
     def __init__(self, win, game):
@@ -1021,8 +1315,8 @@ class InboxPage(Gtk.Box):
         self.append(self.stack)
 
         note = Gtk.Label(wrap=True, xalign=0, margin_start=14, margin_end=14, margin_bottom=8,
-                         label="Se copian, no se mueven, y en la biblioteca nunca se sobrescribe nada. Los PS2 van a DVD/ "
-                               "con nombre OPL; los de PS1 se convierten a .VCD en POPS/ (o se copian tal cual, según "
+                         label="Se copian, no se mueven, y en la biblioteca nunca se sobrescribe nada. Los PS2 van a DVD/ (o a CD/ "
+                               "si son juegos de CD) con nombre OPL; los de PS1 se convierten a .VCD en POPS/ (o se copian tal cual, según "
                                "Ajustes). Con 🗑 puedes llevar a la papelera lo que ya copiaste. Clic derecho en un juego "
                                "para más opciones.")
         note.add_css_class("caption")
@@ -1377,6 +1671,23 @@ class SettingsDialog(Adw.PreferencesDialog):
                              active=bool(cfg.get("pops_apps", True)))
         apps.connect("notify::active", lambda r, _p: self._set("pops_apps", r.get_active(), reload=False))
         g1.add(apps)
+        devs = ["usb", "smb"]
+        dev_row = Adw.ComboRow(title="OPL carga los juegos de PS1 desde",
+                               subtitle="USB: XX.&lt;juego&gt;.ELF. Red SMB: SB.&lt;juego&gt;.ELF; los .VCD van en POPS/ de "
+                                        "la carpeta compartida y la memory card necesita el paquete de red de "
+                                        "POPStarter en mc0:/POPSTARTER/ (SMBCONFIG.DAT, IPCONFIG.DAT y módulos IRX).",
+                               model=Gtk.StringList.new(["USB (XX.)", "Red SMB (SB.)"]))
+        cur_dev = cfg.get("pops_device", "usb")
+        dev_row.set_selected(devs.index(cur_dev) if cur_dev in devs else 0)
+        dev_row.connect("notify::selected", lambda r, _p: self._set("pops_device", devs[r.get_selected()]))
+        g1.add(dev_row)
+        net_row = Adw.ActionRow(title="Archivos de red de POPStarter para la memory card",
+                                subtitle="Crea SMBCONFIG.DAT e IPCONFIG.DAT para mc0:/POPSTARTER/ (modo SMB).")
+        net_btn = Gtk.Button(label="Crear…", valign=Gtk.Align.CENTER)
+        net_btn.connect("clicked", lambda *_: PopsNetDialog(self.win).present(self))
+        net_row.add_suffix(net_btn)
+        net_row.set_activatable_widget(net_btn)
+        g1.add(net_row)
         self.pops_row = Adw.ActionRow(title="Archivos de POPS guardados en este equipo")
         add_pops = Gtk.Button(label="Agregar…", valign=Gtk.Align.CENTER,
                               tooltip_text="Elegir POPSTARTER.ELF o POPS_IOX.PAK. Se copian a la unidad solo si "

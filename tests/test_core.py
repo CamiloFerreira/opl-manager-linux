@@ -57,6 +57,13 @@ class TestNames(unittest.TestCase):
 
 
 class TestDisc(unittest.TestCase):
+    def test_system_cnf_with_tabs(self):
+        # Champions of Norrath (PAL): "BOOT2\t= cdrom0:\\SLES_523.73;1"
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "Champions.iso")
+            make_iso(p, b"BOOT2\t= cdrom0:\\SLES_523.73;1\r\nVER\t= 1.02\r\nVMODE\t= PAL\r\n")
+            self.assertEqual(core.disc_info(p), ("PS2", "SLES_523.73"))
+
     def test_reads_ps2_and_ps1(self):
         with tempfile.TemporaryDirectory() as d:
             ps2, ps1 = os.path.join(d, "a.iso"), os.path.join(d, "b.iso")
@@ -230,6 +237,87 @@ class TestNameFixes(unittest.TestCase):
             for bad in ("../a.iso", "", ".."):
                 with self.assertRaises(ValueError):
                     core.rename_to(g, bad)
+
+
+class TestDiagnostics(unittest.TestCase):
+    CNF = b"BOOT2 = cdrom0:\\SLUS_209.46;1\r\nVER = 1.00\r\n"
+
+    def _iso(self, d, rel, cnf=None, vol=None, pad=0):
+        p = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        make_iso(p, cnf or self.CNF)
+        with open(p, "r+b") as f:
+            size = os.path.getsize(p)
+            f.seek(16 * 2048 + 80)
+            f.write((vol if vol is not None else size // 2048).to_bytes(4, "little"))
+        return p
+
+    def _titles(self, issues, path=None):
+        return sorted(i.title for i in issues if path is None or i.path == path)
+
+    def test_incomplete_iso(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._iso(d, "DVD/SLUS_209.46.GTA.iso", vol=4000)
+            issues = core.diagnose_library(d, core.scan_library(d))
+            self.assertIn("Imagen incompleta", self._titles(issues, p))
+            inc = [i for i in issues if i.title == "Imagen incompleta"][0]
+            self.assertEqual((inc.level, inc.fix), ("error", "trash"))
+
+    def test_cd_game_in_dvd_and_move(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._iso(d, "DVD/SLUS_209.46.Chico.iso")
+            g = core.scan_library(d)[0]
+            issues = core.diagnose_game(g)
+            self.assertEqual([(i.title, i.fix) for i in issues], [("Juego de CD en DVD/", "move_cd")])
+            new = core.move_game(g, "CD")
+            self.assertEqual(new, os.path.join(d, "CD", "SLUS_209.46.Chico.iso"))
+            self.assertFalse(os.path.exists(p))
+            self.assertEqual(core.diagnose_game(core.scan_library(d)[0]), [])
+
+    def test_ps1_in_dvd_and_wrong_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            p1 = self._iso(d, "CD/SLUS_000.01.PS1.iso", cnf=b"BOOT = cdrom:\\SCUS_949.00;1\r\n")
+            p2 = self._iso(d, "CD/SLES_111.11.Otro.iso")
+            issues = core.diagnose_library(d, core.scan_library(d))
+            self.assertIn("Juego de PS1 en CD/", self._titles(issues, p1))
+            self.assertIn("El código del nombre no es el del disco", self._titles(issues, p2))
+
+    def test_not_a_disc_and_unreadable_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "DVD"))
+            os.makedirs(os.path.join(d, "CD"))
+            with open(os.path.join(d, "DVD", "basura.iso"), "wb") as f:
+                f.write(b"\0" * 100000)
+            open(os.path.join(d, "CD", "Juego PS1.bin"), "wb").close()
+            issues = core.diagnose_library(d, core.scan_library(d))
+            self.assertIn("No es una imagen de disco válida", self._titles(issues))
+            self.assertIn("OPL no lee archivos .bin en CD/", self._titles(issues))
+            self.assertEqual(issues[0].level, "error")             # lo grave primero
+
+    def test_import_cd_game_goes_to_cd(self):
+        it = core.InboxItem(files=["/x/Chico.iso"], console="PS2", gid="SLUS_209.46", title="Chico",
+                            size=200 * 1024 * 1024, origin="")
+        self.assertEqual(core.item_destination(it, {})[1], "CD")
+        it.size = 3 * 1024 ** 3
+        self.assertEqual(core.item_destination(it, {})[1], "DVD")
+
+    def test_fragmentation_issues(self):
+        g1 = core.Game("/l/DVD/a.iso", "DVD", "", "a", 1, "/l")
+        g2 = core.Game("/l/DVD/b.iso", "DVD", "", "b", 1, "/l")
+        issues = core.fragmentation_issues([g1, g2], {g1.path: 1, g2.path: 37})
+        self.assertEqual([(i.path, i.title) for i in issues], [(g2.path, "Archivo fragmentado (37 trozos)")])
+
+    def test_fragmentation_runs_filefrag(self):
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as d:
+            p = os.path.join(d, "a.iso")
+            with open(p, "wb") as f:
+                f.write(b"x" * 100000)
+            try:
+                res = core.fragmentation([p])
+            except (FileNotFoundError, core.NeedsRoot):
+                self.skipTest("filefrag no disponible o sin FIEMAP aquí")
+            self.assertIn(p, res)
+            self.assertGreaterEqual(res[p], 1)
 
 
 if __name__ == "__main__":
