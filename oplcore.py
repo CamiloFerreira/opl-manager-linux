@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")

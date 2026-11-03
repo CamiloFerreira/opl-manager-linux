@@ -43,10 +43,9 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           OPL_REQUIRE_SIGNATURE: "1"
         run: |
-          umask 077
           KEY="$RUNNER_TEMP/signing.pem"
           trap 'shred -u "$KEY" 2>/dev/null || rm -f "$KEY"' EXIT
-          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY"
+          ( umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY" )   # solo la clave con 0600
           OPL_SIGNING_KEY_FILE="$KEY" ./packaging/make-release.sh
 
       - name: Probar instalación del .deb

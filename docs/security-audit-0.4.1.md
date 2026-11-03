@@ -1,4 +1,4 @@
-# Auditoría de seguridad — OPL Manager 0.4.0
+# Auditoría de seguridad — OPL Manager 0.4.1
 
 **Fecha:** 2026-11-03 · **Alcance:** `oplcore.py`, `opl_manager.py`, `updater.py`, `tray.py`, scripts de
 empaquetado y workflows de GitHub Actions (versión auditada: 0.3.1).
@@ -24,7 +24,7 @@ empaquetado y workflows de GitHub Actions (versión auditada: 0.3.1).
 
 ## Hallazgos y correcciones
 
-| # | Gravedad | Hallazgo (0.3.1) | Corrección (0.4.0) | Control |
+| # | Gravedad | Hallazgo (0.3.1) | Corrección (0.4.1) | Control |
 |---|---|---|---|---|
 | 1 | **Crítica** | La actualización automática solo comprobaba el SHA256 publicado **en el mismo release**: quien pudiera subir archivos al release (token o cuenta comprometidos) podía hacer que todos los clientes instalaran código suyo, incluso como root vía `.deb`. | Firma Ed25519 de `SHA256SUMS` con clave guardada como secreto del CI; la clave pública va fija en la app; sin firma válida no se instala nada. | [8.24] criptografía, [8.32] cambios, [8.19] instalación de software |
 | 2 | Alta | Sin forma de obligar a actualizar las versiones vulnerables. | Manifiesto firmado `release.json` con `min_safe_version`: actualización **obligatoria**, aunque las automáticas estén apagadas; un diálogo que no se puede cerrar bloquea la app hasta actualizar (sin cortar copias en curso). | [8.8] gestión de vulnerabilidades técnicas |
@@ -50,8 +50,8 @@ empaquetado y workflows de GitHub Actions (versión auditada: 0.3.1).
 
 ## Riesgo residual
 
-- Las instalaciones 0.3.1 o anteriores todavía **no verifican firmas**: se actualizan a 0.4.0 con el mecanismo
-  anterior (solo SHA256). Desde 0.4.0 toda la cadena queda protegida.
+- Las instalaciones 0.3.1 o anteriores todavía **no verifican firmas**: se actualizan a 0.4.1 con el mecanismo
+  anterior (solo SHA256). Desde 0.4.1 toda la cadena queda protegida.
 - El modo `.deb` necesita la contraseña del usuario: el bloqueo es obligatorio, pero la instalación depende de
   que la escriba.
 - Quien controle el usuario local ya puede modificar el ejecutable instalado en `~/.local/bin`: eso queda fuera

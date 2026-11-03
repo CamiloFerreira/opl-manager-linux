@@ -1,4 +1,4 @@
 {
-  "min_safe_version": "0.4.0",
-  "advisory": "La versión 0.4.0 corrige: actualizaciones sin firma digital (se podía instalar un ejecutable manipulado si el release era alterado), descargas sin límite de tamaño ni restricción a HTTPS, nombres de archivo que podían escapar de la biblioteca y fallos al leer imágenes de disco manipuladas."
+  "min_safe_version": "0.4.1",
+  "advisory": "La versión 0.4.1 corrige: actualizaciones sin firma digital (se podía instalar un ejecutable manipulado si el release era alterado), descargas sin límite de tamaño ni restricción a HTTPS, nombres de archivo que podían escapar de la biblioteca y fallos al leer imágenes de disco manipuladas."
 }

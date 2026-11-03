@@ -8,8 +8,8 @@ actualiza de forma **obligatoria**.
 
 | Versión  | Soporte |
 |----------|---------|
-| ≥ 0.4.0  | ✅ |
-| < 0.4.0  | ❌ actualizar (actualizaciones sin firma digital) |
+| ≥ 0.4.1  | ✅ |
+| < 0.4.1  | ❌ actualizar (actualizaciones sin firma digital) |
 
 ## Reportar una vulnerabilidad
 
