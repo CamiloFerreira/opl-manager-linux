@@ -298,7 +298,7 @@ def apply_update(rel, local_version=None):
         try:
             deb = _download_verified(rel, name, tmpdir)
             os.chmod(deb, 0o444)
-            os.chmod(tmpdir, 0o555)                   # apt (_apt) necesita leerlo; nadie puede cambiarlo
+            os.chmod(tmpdir, 0o555)  # nosec B103 - apt (_apt) necesita leerlo; nadie puede escribir
             pkexec, apt = shutil.which("pkexec"), shutil.which("apt-get")
             if not pkexec or not apt:
                 raise UpdateError("Falta pkexec o apt-get")
