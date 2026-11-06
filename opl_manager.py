@@ -29,6 +29,8 @@ CSS = b"""
 .cover-missing { border-radius: 6px; background: alpha(currentColor, 0.08); }
 .game-title { font-weight: 600; }
 .art-thumb { border-radius: 4px; background: alpha(currentColor, 0.06); }
+.game-card.picked { background: alpha(@accent_bg_color, 0.25); box-shadow: inset 0 0 0 2px @accent_bg_color; }
+.pick-check { background: @accent_bg_color; color: @accent_fg_color; border-radius: 999px; padding: 3px; margin: 6px; }
 """
 
 
@@ -91,8 +93,8 @@ def cover_widget(path, w=COVER_W, h=COVER_H, label=""):
 
 
 # =============================================================== Utilidades comunes
-def add_context_menu(widget, build_menu):
-    """Menú con clic derecho (o manteniendo pulsado en pantallas táctiles)."""
+def add_context_menu(widget, build_menu, hold=True):
+    """Menú con clic derecho (o manteniendo pulsado en pantallas táctiles, si hold)."""
     def show(x, y):
         pop = Gtk.PopoverMenu.new_from_model(build_menu())
         pop.set_parent(widget)
@@ -109,9 +111,10 @@ def add_context_menu(widget, build_menu):
     click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
     click.connect("pressed", pressed)
     widget.add_controller(click)
-    hold = Gtk.GestureLongPress(touch_only=True)
-    hold.connect("pressed", lambda _g, x, y: show(x, y))
-    widget.add_controller(hold)
+    if hold:
+        lp = Gtk.GestureLongPress(touch_only=True)
+        lp.connect("pressed", lambda _g, x, y: show(x, y))
+        widget.add_controller(lp)
 
 
 def action_group(actions):
@@ -296,18 +299,30 @@ def download_game_art(win, game, on_done=None):
 
 
 def trash_game_dialog(win, game):
-    arts = core.game_art_files(game, win.library.games)
+    trash_games_dialog(win, [game])
+
+
+def trash_games_dialog(win, games, on_done=None):
+    """Confirma y mueve a la papelera uno o varios juegos (con su acceso de APPS/ y, si se pide, su arte)."""
+    arts = core.games_art_files(games, win.library.games)
     chk = None
     if arts:
         chk = Gtk.CheckButton(label=f"También mover su arte ({len(arts)} imágenes de ART/)")
-    paths = [game.path]
-    if game.kind == "POPS" and core.has_pops_app(game.library, game.path):
-        paths.append(core.pops_app_dir(game.library, game.path))     # su acceso en APPS/ ya no serviría
-        paths += core.pops_app_art_files(game.library, game.path)
-    confirm_trash(win, f"¿Mover «{game.title}» a la papelera?", paths,
-                  lambda: trash_paths(win, paths + (arts if chk and chk.get_active() else []),
-                                      win.library.reload),
-                  extra_child=chk)
+    paths = []
+    for game in games:
+        paths.append(game.path)
+        if game.kind == "POPS" and core.has_pops_app(game.library, game.path):
+            paths.append(core.pops_app_dir(game.library, game.path))     # su acceso en APPS/ ya no serviría
+            paths += core.pops_app_art_files(game.library, game.path)
+    paths = list(dict.fromkeys(paths))
+    heading = (f"¿Mover «{games[0].title}» a la papelera?" if len(games) == 1
+               else f"¿Mover {len(games)} juegos a la papelera?")
+
+    def go():
+        if on_done:
+            on_done()
+        trash_paths(win, paths + (arts if chk and chk.get_active() else []), win.library.reload)
+    confirm_trash(win, heading, paths, go, extra_child=chk)
 
 
 # =============================================================== Biblioteca
@@ -317,6 +332,9 @@ class LibraryPage(Gtk.Box):
         self.win = win
         self.games = []
         self.filter_text = ""
+        self._held = None
+        self.picked = set()          # rutas de los juegos seleccionados (modo selección)
+        self.selecting = False
 
         # barra: buscador + controles; en ventanas angostas los controles bajan a otra fila
         self.bar = bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
@@ -329,7 +347,7 @@ class LibraryPage(Gtk.Box):
         bar.append(controls)
         bar = controls          # los controles se agregan a la fila que se acomoda sola
         self.kind = Gtk.DropDown.new_from_strings(["Todos", "PS2 (DVD/CD)", "PS1 (POPS)", "Sin portada", "Nombre sin formato"])
-        self.kind.connect("notify::selected", lambda *_: self.flow.invalidate_filter())
+        self.kind.connect("notify::selected", lambda *_: (self.flow.invalidate_filter(), self._update_selection()))
         bar.append(self.kind)
         self.sort = Gtk.DropDown.new_from_strings(core.SORT_NAMES)
         self.sort.set_tooltip_text("Ordenar por")
@@ -397,6 +415,31 @@ class LibraryPage(Gtk.Box):
         self.stack.add_named(self.loading, "loading")
         self.append(self.stack)
 
+        # ---- barra del modo selección (aparece al mantener pulsado un juego)
+        self.sel_bar = Gtk.ActionBar(revealed=False)
+        cancel = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Salir de la selección (Esc)")
+        cancel.connect("clicked", lambda *_: self.exit_selection())
+        self.sel_bar.pack_start(cancel)
+        self.sel_label = Gtk.Label()
+        self.sel_label.add_css_class("heading")
+        self.sel_bar.pack_start(self.sel_label)
+        self.sel_del = Gtk.Button(label="Borrar seleccionados", tooltip_text="Mover a la papelera (Supr)")
+        self.sel_del.add_css_class("destructive-action")
+        self.sel_del.connect("clicked", lambda *_: self.delete_picked())
+        self.sel_bar.pack_end(self.sel_del)
+        self.sel_all = Gtk.Button(label="Seleccionar todo", tooltip_text="Selecciona los juegos visibles (Ctrl+A)")
+        self.sel_all.connect("clicked", lambda *_: self.toggle_all())
+        self.sel_bar.pack_end(self.sel_all)
+        self.append(self.sel_bar)
+
+        keys = Gtk.ShortcutController(scope=Gtk.ShortcutScope.MANAGED)
+        for trigger, cb in (("Escape", self.exit_selection), ("Delete", self.delete_picked),
+                            ("<Control>a", self.toggle_all)):
+            keys.add_shortcut(Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string(trigger),
+                                           action=Gtk.CallbackAction.new(
+                                               lambda *_a, cb=cb: self.selecting and (cb(), True)[1])))
+        self.add_controller(keys)
+
     # ---- carga
     def reload(self):
         lib = self.win.cfg["library"]
@@ -420,6 +463,7 @@ class LibraryPage(Gtk.Box):
 
     def _loaded(self, games):
         self.games = games
+        self.picked &= {g.path for g in games}
         while (c := self.flow.get_first_child()):
             self.flow.remove(c)
         for g in games:
@@ -445,13 +489,22 @@ class LibraryPage(Gtk.Box):
         self.empty.set_description("No hay juegos en DVD/, CD/ ni POPS/. Cópialos desde la Bandeja de entrada.")
         self.stack.set_visible_child_name("grid" if games else "empty")
         self.flow.invalidate_filter()
+        if self.selecting and not self.picked:
+            self.exit_selection()
+        else:
+            self._update_selection()
 
     def _card(self, g):
         btn = Gtk.Button(halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
         btn.add_css_class("flat")
         btn.add_css_class("game-card")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.append(cover_widget(g.art("COV"), label=g.kind))
+        cover = Gtk.Overlay(child=cover_widget(g.art("COV"), label=g.kind))
+        check = Gtk.Image(icon_name="object-select-symbolic", halign=Gtk.Align.END, valign=Gtk.Align.START,
+                          visible=False, can_target=False)
+        check.add_css_class("pick-check")
+        cover.add_overlay(check)
+        box.append(cover)
         t = Gtk.Label(label=g.title, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=16, lines=2,
                       ellipsize=Pango.EllipsizeMode.END, justify=Gtk.Justification.CENTER)
         t.add_css_class("game-title")
@@ -463,7 +516,12 @@ class LibraryPage(Gtk.Box):
         box.append(sub)
         btn.set_child(box)
         btn.set_tooltip_text(f"{g.filename}\n{core.human_size(g.size)}")
-        btn.connect("clicked", lambda *_: GameDialog(self.win, g).present(self.win))
+        btn.connect("clicked", lambda *_: self._on_card_click(child))
+        hold = Gtk.GestureLongPress()        # mantener pulsado (ratón o táctil): empezar a seleccionar
+        hold.connect("pressed", lambda gst, *_: (gst.set_state(Gtk.EventSequenceState.CLAIMED),
+                                                 self._on_card_hold(child)))
+        hold.connect("end", lambda *_: GLib.idle_add(self._clear_held))
+        btn.add_controller(hold)
         win = self.win
         btn.insert_action_group("card", action_group({
             "open": (lambda: GameDialog(win, g).present(win), True),
@@ -473,6 +531,7 @@ class LibraryPage(Gtk.Box):
             "folder": (lambda: open_folder(g.path), True),
             "copy-name": (lambda: (win.get_clipboard().set(g.filename), win.toast("Nombre copiado")), True),
             "trash": (lambda: trash_game_dialog(win, g), True),
+            "select": (lambda: self._on_card_hold(child), True),
         }))
 
         def menu():
@@ -483,14 +542,92 @@ class LibraryPage(Gtk.Box):
             b.append("Cambiar portada…", "card.cover")
             b.append("Abrir carpeta", "card.folder")
             b.append("Copiar nombre del archivo", "card.copy-name")
+            c.append("Seleccionar varios", "card.select")
             c.append("Mover a la papelera…", "card.trash")
             for sec in (a, b, c):
                 m.append_section(None, sec)
             return m
-        add_context_menu(btn, menu)
+        add_context_menu(btn, menu, hold=False)
         child = Gtk.FlowBoxChild(child=btn)
         child.game = g
+        child.btn = btn
+        child.check = check
+        self._paint(child)
         return child
+
+    # ---- selección múltiple
+    def _paint(self, child):
+        on = child.game.path in self.picked
+        child.check.set_visible(on)
+        (child.btn.add_css_class if on else child.btn.remove_css_class)("picked")
+
+    def _on_card_hold(self, child):
+        self._held = child          # el clic que llega al soltar no debe deshacer la selección
+        self.selecting = True
+        self.picked.add(child.game.path)
+        self._paint(child)
+        self._update_selection()
+
+    def _clear_held(self):
+        self._held = None
+        return False
+
+    def _on_card_click(self, child):
+        if self._held is child:
+            self._held = None
+            return
+        self._held = None
+        if not self.selecting:
+            GameDialog(self.win, child.game).present(self.win)
+            return
+        self.picked.symmetric_difference_update({child.game.path})
+        self._paint(child)
+        if not self.picked:
+            self.exit_selection()
+        else:
+            self._update_selection()
+
+    def _children(self):
+        c = self.flow.get_first_child()
+        while c:
+            yield c
+            c = c.get_next_sibling()
+
+    def _visible_children(self):
+        return [c for c in self._children() if self._filter(c)]
+
+    def toggle_all(self):
+        vis = {c.game.path for c in self._visible_children()}
+        if vis <= self.picked:
+            self.picked -= vis
+        else:
+            self.picked |= vis
+        for c in self._children():
+            self._paint(c)
+        if not self.picked:
+            self.exit_selection()
+        else:
+            self._update_selection()
+
+    def exit_selection(self):
+        self.selecting = False
+        self.picked.clear()
+        for c in self._children():
+            self._paint(c)
+        self._update_selection()
+
+    def _update_selection(self):
+        n = len(self.picked)
+        self.sel_bar.set_revealed(self.selecting)
+        self.sel_label.set_text(f"{n} seleccionado" + ("" if n == 1 else "s"))
+        self.sel_del.set_sensitive(n > 0)
+        vis = {c.game.path for c in self._visible_children()}
+        self.sel_all.set_label("Quitar selección" if vis and vis <= self.picked else "Seleccionar todo")
+
+    def delete_picked(self):
+        games = [g for g in self.games if g.path in self.picked]
+        if games:
+            trash_games_dialog(self.win, games, self.exit_selection)
 
     def _on_sort(self, *_):
         self.win.cfg["sort"] = int(self.sort.get_selected())
@@ -500,6 +637,7 @@ class LibraryPage(Gtk.Box):
     def _on_search(self, entry):
         self.filter_text = entry.get_text().lower().strip()
         self.flow.invalidate_filter()
+        self._update_selection()
 
     def _filter(self, child):
         g = child.game

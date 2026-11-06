@@ -838,6 +838,17 @@ def game_art_files(game, all_games):
     return [p for t in ART_TYPES if (p := game.art(t))]
 
 
+def games_art_files(games, all_games):
+    """Imágenes de ART/ de varios juegos que se borran juntos: solo los códigos que no usa ningún otro juego."""
+    ids = {id(g) for g in games}
+    out = []
+    for g in games:
+        if not g.gid or any(id(o) not in ids and o.gid == g.gid for o in all_games):
+            continue
+        out += [p for t in ART_TYPES if (p := g.art(t)) and p not in out]
+    return out
+
+
 def path_size(path):
     if os.path.isfile(path):
         return os.path.getsize(path)

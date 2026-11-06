@@ -239,6 +239,23 @@ class TestNameFixes(unittest.TestCase):
                     core.rename_to(g, bad)
 
 
+class TestTrashArt(unittest.TestCase):
+    def test_games_art_files_keeps_shared_art(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "ART"))
+            for gid in ("SLUS_206.78", "SLES_533.66"):
+                open(os.path.join(d, "ART", f"{gid}_COV.png"), "wb").close()
+            gow1 = core.Game(os.path.join(d, "DVD", "a.iso"), "DVD", "SLUS_206.78", "a", 1, d)
+            gow2 = core.Game(os.path.join(d, "DVD", "b.iso"), "DVD", "SLUS_206.78", "b", 1, d)
+            k7 = core.Game(os.path.join(d, "DVD", "c.iso"), "DVD", "SLES_533.66", "c", 1, d)
+            todos = [gow1, gow2, k7]
+            cov = lambda gid: os.path.join(d, "ART", f"{gid}_COV.png")  # noqa: E731
+            # otro juego que se queda usa el mismo código: su arte no se toca
+            self.assertEqual(core.games_art_files([gow1, k7], todos), [cov("SLES_533.66")])
+            # si se borran las dos copias, el arte ya no lo usa nadie (y no se repite)
+            self.assertEqual(core.games_art_files([gow1, gow2], todos), [cov("SLUS_206.78")])
+
+
 class TestDiagnostics(unittest.TestCase):
     CNF = b"BOOT2 = cdrom0:\\SLUS_209.46;1\r\nVER = 1.00\r\n"
 
