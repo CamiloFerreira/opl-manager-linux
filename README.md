@@ -45,6 +45,9 @@ Hecho en Python con **GTK 4 + libadwaita**, así que se ve nativo en GNOME.
 - **Duplicados**: detecta ISOs con el mismo código y te deja elegir cuál conservar; las demás van a la papelera.
 - **Clic derecho en un juego**: ver detalles, cambiar nombre, descargar arte, cambiar portada, abrir carpeta,
   copiar el nombre del archivo o moverlo a la papelera (opcionalmente con su arte).
+- **Selección múltiple**: mantén pulsado un juego (o clic derecho → «Seleccionar varios») y toca otros para
+  marcarlos. La barra de abajo permite seleccionar todos los visibles (Ctrl+A) y borrar los seleccionados (Supr):
+  van a la papelera junto con su acceso de PS1 en `APPS/` y, si quieres, el arte que ya no usa ningún otro juego.
 
 **Bandeja de entrada** (tus carpetas de ROMs: descargas, colección en el equipo…):
 - Lee el código de cada juego directamente del disco (`SYSTEM.CNF`) y distingue PS2 de PS1.

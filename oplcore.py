@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import pops
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # ---------------------------------------------------------------- constantes
 ID_RE = re.compile(r"([A-Z]{4})[_-](\d{3})\.(\d{2})")
